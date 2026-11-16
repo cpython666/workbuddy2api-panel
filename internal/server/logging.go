@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // maxUserAgentLen 归档与面板展示保留的 UA 字节上限。UA 是客户端完全可控的
@@ -43,43 +43,71 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start            time.Time
-	model            string
-	mode             string // "stream" | "sync"
-	uid              string // 完整 uid，展示时只取前 8 位
-	nick             string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
-	ttfb             time.Duration
-	toks             int // <0 表示 usage 缺失 → 显示 "-"
-	status           int
-	requestID        string
-	outcome          string
-	attempts         int
-	credit           float64
-	hasCredit        bool
+	start time.Time
+	model string
+	mode  string // "stream" | "sync"
+	uid   string // 完整 uid，展示时只取前 8 位
+	nick  string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	realm string // 选中账号所在域（cn / global），写入归档事件供面板区分同名模型
+	ttfb  time.Duration
+	toks  int // <0 表示 usage 缺失 → 显示 "-"
+	// think：本次 completion_tokens 里有多少是思考 token（上游把思考算进 completion）。
+	// <0 = 上游没给该字段（非推理模型/旧形态），此时行里不显示 think=。
+	think     int
+	status    int
+	requestID string
+	outcome   string
+	attempts  int
+	credit    float64
+	hasCredit bool
+	// promptTokens/completionTokens/totalTokens 供请求指标归档（每次 attempt 覆盖）。
 	promptTokens     int64
 	completionTokens int64
 	totalTokens      int64
-	// 缓存命中观测（usage.prompt_cache_hit_tokens / miss）：上游给到才有效。
-	// 供 usage 桶命中率维度与 reqlog 逐次记录；缺失时 hasCache=false 不参与统计。
-	cacheHit  int64
-	cacheMiss int64
-	hasCache  bool
+	cacheHit         int
+	cacheMiss        int
+	hasCache         bool
+	budget           *dailyBudget
 
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
 
+	// toolsDeclared / toolCalls 本轮工具面观测量（issue #44）：声明数与实际调用数。
+	// 前者 >0 且后者 ==0 即「零工具调用收尾」，归档里可据此算发生率。
+	toolsDeclared int
+	toolCalls     int
+
+	// 上游调用分段耗时（见 upstream.ChatTiming）：prep 本地准备、do 上游往返。
+	// 零值 = 未测量（非流式/未走到上游）。
+	prep, do time.Duration
+
+	// effort 本次实际生效的思考档位（降级后出站值）。
+	// effortReq 客户端原始请求档位（injectThinking 补默认档之前抓的）。
+	// 两者分开的原因见 issue #43：只报生效值时，「客户端设了 max、日志显示 high」
+	// 无法判断是客户端根本没发出去，还是被网关按模型档位表降级了。
+	effort    string
+	effortReq string
+
+	// modelEff 模型降级（pool.model_fallback）后**实际使用**的模型（与 effort/effortReq
+	// 同一哲学：请求值与实际生效值分开记录，未降级时为空）。
+	modelEff string
+
 	logged bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+// model 由调用方传入已解析的 peek.Model（空串按 "-" 展示），避免再解析一次 body。
+func newChatStat(now time.Time, model string, stream bool, budget *dailyBudget) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	if model == "" {
+		model = "-"
+	}
+	return &chatStat{start: now, model: model, mode: mode, toks: -1, think: -1, budget: budget}
 }
 
 // done 幂等落一行表格日志。
@@ -88,8 +116,17 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+	total := time.Since(s.start)
+	logChatRowFull(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+		s.think, s.cacheHit, s.cacheMiss, s.hasCache,
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit,
+		s.clientIP, s.userAgent, s.prep, s.do, s.effort, s.effortReq, s.modelEff)
+	s.budget.add(s.credit, s.hasCredit)
+	s.budget.observeCache(int64(s.cacheHit), int64(s.cacheMiss), s.hasCache)
+	// 上游劣化滑窗采样（见 upstreamhealth.go）：收口处唯一能同时拿到 status /
+	// outcome / TTFB 的地方。纯观测，不改路径。
+	chatUpHealth.record(s.status, s.outcome, s.ttfb)
+	noteProm(s, total)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -107,15 +144,23 @@ type chatStatsReader struct {
 	hasCompletionTokens bool
 	hasTotalTokens      bool
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
-	hasCredit  bool
-	credit     float64
-	errorFrame bool
-	// cacheHit/cacheMiss 上游末帧 usage.prompt_cache_hit_tokens / miss_tokens，
-	// 供用量桶的命中率维度与 reqlog 逐次记录（issue #92）。
-	hasCacheHit  bool
+	hasCredit    bool
+	credit       float64
 	cacheHit     int
 	cacheMiss    int
+	hasCache     bool
+	hasCacheHit  bool
 	hasCacheMiss bool
+	// thinkTokens 末帧 usage 里的**思考 token 数**（上游把思考算进 completion_tokens：
+	// 实测 completion=100 里 91 是思考）。用于解释「速率看着慢」——Codex 这类高推理档
+	// 流量的 completion 里思考占七到八成，正文只占小头。
+	thinkTokens int
+	hasThink    bool
+	errorFrame  bool
+	// issue #44 观测：本流是否出现过非空 delta.tool_calls、最后一个非空 finish_reason。
+	// 两者组合用于识别「声明了 tools 却拿到 stop + 零 tool_calls」的静默回合。
+	sawToolCalls bool
+	finishReason string
 	pend         []byte // 已读未返回的行缓存
 }
 
@@ -127,8 +172,18 @@ func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
 func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
+// Thinking 返回末帧 usage 里的思考 token 数（上游字段 completion_thinking_tokens，
+// 兼容 completion_tokens_details.reasoning_tokens）；两个都缺时 ok=false。
+func (s *chatStatsReader) Thinking() (int, bool) { return s.thinkTokens, s.hasThink }
+
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
+
+// SawToolCalls 报告本流是否出现过非空 delta.tool_calls（issue #44 观测）。
+func (s *chatStatsReader) SawToolCalls() bool { return s.sawToolCalls }
+
+// FinishReason 本流最后一个非空 finish_reason；上游没给过则为空串。
+func (s *chatStatsReader) FinishReason() string { return s.finishReason }
 
 // Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
@@ -138,6 +193,7 @@ func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.ha
 
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
+	hit, miss, hasCache := s.Cache()
 	return pool.TokenUsageDelta{
 		HasPromptTokens:     s.hasPromptTokens,
 		PromptTokens:        int64(s.promptTokens),
@@ -145,7 +201,30 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		CompletionTokens:    int64(s.completionTokens),
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
+		HasCacheTokens:      hasCache,
+		CacheHitTokens:      int64(hit),
+		CacheMissTokens:     int64(miss),
+		HasCredit:           s.hasCredit,
+		Credit:              s.credit,
 	}
+}
+
+// Cache 返回末帧 usage 的 prompt 缓存命中/未命中 token 与是否缺失。
+// miss 缺失时按 prompt-hit 推导（与上游 issue #92 同步口径）；hit 与 miss 均不可得
+// 时 ok=false（不参与命中率统计）。
+func (s *chatStatsReader) Cache() (hit, miss int, ok bool) {
+	if !s.hasCacheHit && !s.hasCacheMiss {
+		return 0, 0, false
+	}
+	hit, miss = s.cacheHit, s.cacheMiss
+	if !s.hasCacheMiss {
+		if s.hasPromptTokens && s.promptTokens >= s.cacheHit {
+			miss = s.promptTokens - s.cacheHit
+		} else {
+			miss = 0 // 推导不可信（prompt 缺失/矛盾）：留 0，不计假数据
+		}
+	}
+	return hit, miss, true
 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
@@ -164,23 +243,46 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
+		// issue #44：只取 delta.tool_calls 与 finish_reason 两个字段。encoding/json
+		// 会跳过未声明的键（含 content），不为正文分配内存。
+		Choices []struct {
+			Delta struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
 		Usage *struct {
-			PromptTokens         *int     `json:"prompt_tokens"`
-			CompletionTokens     *int     `json:"completion_tokens"`
-			TotalTokens          *int     `json:"total_tokens"`
-			Credit               *float64 `json:"credit"`
-			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
+			PromptTokens     *int `json:"prompt_tokens"`
+			CompletionTokens *int `json:"completion_tokens"`
+			// 思考 token：上游两个字段都出现过（顶层 completion_thinking_tokens 与
+			// 嵌套 completion_tokens_details.reasoning_tokens），取到哪个用哪个。
+			CompletionThinkingTokens *int `json:"completion_thinking_tokens"`
+			CompletionTokensDetails  *struct {
+				ReasoningTokens *int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+			TotalTokens           json.RawMessage `json:"total_tokens"`
+			Credit                json.RawMessage `json:"credit"`
+			PromptCacheHitTokens  *int            `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens *int            `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
-			s.errorFrame = true
-		}
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
 	if len(chunk.Error) > 0 {
 		s.errorFrame = true
+	}
+	for _, c := range chunk.Choices {
+		// 上游每帧都带 "tool_calls":[]（空数组），所以判据是长度而不是字段存在。
+		if len(c.Delta.ToolCalls) > 0 {
+			s.sawToolCalls = true
+		}
+		if c.FinishReason != "" {
+			s.finishReason = c.FinishReason
+		}
+	}
+	if chunk.Usage == nil {
+		return
 	}
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
@@ -190,39 +292,54 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasCompletionTokens = true
 		s.completionTokens = *chunk.Usage.CompletionTokens
 	}
-	if chunk.Usage.TotalTokens != nil {
-		s.hasTotalTokens = true
-		s.totalTokens = *chunk.Usage.TotalTokens
+	// 思考 token（两个字段都在就取顶层，上游顶层口径更直接）。
+	if v := chunk.Usage.CompletionThinkingTokens; v != nil {
+		s.hasThink = true
+		s.thinkTokens = *v
+	} else if d := chunk.Usage.CompletionTokensDetails; d != nil && d.ReasoningTokens != nil {
+		s.hasThink = true
+		s.thinkTokens = *d.ReasoningTokens
 	}
-	if chunk.Usage.Credit != nil {
-		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+	// total_tokens / credit 走「先判合法性再采信」：上游偶发小数字段或负值
+	// （旧版直接断言 *int / *float64 会静默截断/采信脏值）。非法值置为「未知」
+	// 并覆盖先前帧——迟到的坏帧不得把早帧的费用当成本响应的账（上游 PR #104）。
+	if len(chunk.Usage.TotalTokens) > 0 {
+		var total float64
+		if json.Unmarshal(chunk.Usage.TotalTokens, &total) == nil {
+			parsedTotal, valid := parseUsageTotalTokens(total)
+			if !valid {
+				s.hasTotalTokens = false
+				s.totalTokens = 0
+			} else {
+				s.hasTotalTokens = true
+				s.totalTokens = parsedTotal
+			}
+		} else {
+			s.hasTotalTokens = false
+			s.totalTokens = 0
+		}
+	}
+	if len(chunk.Usage.Credit) > 0 {
+		var credit float64
+		if json.Unmarshal(chunk.Usage.Credit, &credit) == nil && validUsageCredit(credit, true) {
+			s.hasCredit = true
+			s.credit = credit
+		} else {
+			// 非法 credit 覆盖先前值：不得把早帧的费用归档成本响应的账。
+			s.hasCredit = false
+			s.credit = 0
+		}
 	}
 	if chunk.Usage.PromptCacheHitTokens != nil {
+		s.hasCache = true
 		s.hasCacheHit = true
 		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
 	}
-	if chunk.Usage.PromptCacheMissTok != nil {
+	if chunk.Usage.PromptCacheMissTokens != nil {
+		s.hasCache = true
 		s.hasCacheMiss = true
-		s.cacheMiss = *chunk.Usage.PromptCacheMissTok
+		s.cacheMiss = *chunk.Usage.PromptCacheMissTokens
 	}
-}
-
-// CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
-// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
-func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
-	if !s.hasCacheHit {
-		return 0, 0, false
-	}
-	hit = int64(s.cacheHit)
-	miss = int64(s.cacheMiss)
-	if !s.hasCacheMiss {
-		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
-			return hit, 0, true
-		}
-		miss = int64(s.promptTokens - s.cacheHit)
-	}
-	return hit, miss, true
 }
 
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。
@@ -244,38 +361,6 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return 0, err
-}
-
-// rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
-// 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
-func rewriteModel(body []byte, bare string) []byte {
-	if len(body) == 0 || bare == "" {
-		return body
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
-	}
-	if cur, ok := obj["model"].(string); !ok || cur == bare {
-		return body
-	}
-	obj["model"] = bare
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
-}
-
-// parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
-func parseModelFromBody(body []byte) string {
-	var obj struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &obj); err != nil || obj.Model == "" {
-		return "-"
-	}
-	return obj.Model
 }
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
@@ -315,10 +400,47 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if n, ok := read("total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
+	if n, ok := read("prompt_cache_hit_tokens"); ok {
+		delta.HasCacheTokens, delta.CacheHitTokens = true, n
+	}
+	missSet := false
+	if n, ok := read("prompt_cache_miss_tokens"); ok {
+		delta.HasCacheTokens, delta.CacheMissTokens = true, n
+		missSet = true
+	}
+	// miss 缺失时按 prompt-hit 推导（issue #92 同步口径）；推导不可信则留 0。
+	if !missSet && delta.HasCacheTokens && delta.CacheHitTokens > 0 {
+		if p, okP := read("prompt_tokens"); okP && p >= delta.CacheHitTokens {
+			delta.CacheMissTokens = p - delta.CacheHitTokens
+		}
+	}
+	// 扣费积分（用量视图与成本台账同源）。这里不要求 total_tokens>0——
+	// 历史口径要的是"这一笔花了多少"，拿不到 token 数不该把积分一起丢掉。
+	if c, ok := u["credit"].(float64); ok {
+		delta.HasCredit, delta.Credit = true, c
+	}
 	return delta
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
+// toolCallCount 非流式聚合响应里的工具调用个数（issue #44 观测用）。
+// 只计数，不解析名字与参数。
+func toolCallCount(resp map[string]any) int {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return 0
+	}
+	ch, _ := choices[0].(map[string]any)
+	msg, _ := ch["message"].(map[string]any)
+	// upstream.Aggregate 组包用 []map[string]any，直解上游 JSON 是 []any —— 两种都得认，
+	// 否则非流式这一半永远是 0（issue #44 的比率就会被算高一倍）。
+	if tcs, ok := msg["tool_calls"].([]map[string]any); ok {
+		return len(tcs)
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	return len(tcs)
+}
+
 func completionTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
 	if !ok {
@@ -345,9 +467,15 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// path 本次请求的真实入站路径（isChatEntry 四条之一），归档事件按它记录——
+	// 来源采集与归档已覆盖 /v1/responses、/v1/messages，不能再写死 chat 路径。
+	path string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// context 本轮会话上下文（见 archiveContext），由 logging.request_archive_context
+	// 决定是否填充；关掉时保持 nil，事件里不出现该字段。
+	context json.RawMessage
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -358,6 +486,79 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 	}
 	t.clientIP = clientIPForLog(r)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
+}
+
+// contextMaxBytes 单个事件的上下文上限。内存只留 100 条事件，16KB × 100 = 1.6MB
+// 封顶；归档里也是同一份（超长上下文按「丢最旧的轮次」收敛，不截成半个 JSON）。
+const contextMaxBytes = 16 << 10
+
+// archiveContext 从入站请求体里抽出会话上下文（system + messages，或出图/embedding
+// 的 prompt），供面板「请求事件日志」展开查看。开关关闭时调用方不调用本函数。
+//
+// 只取这三段：tools / 采样参数 / 传输字段与「上下文」无关，体积还可能吃掉整个预算。
+// 超限时丢最旧的消息，仍超就把最后一条的 content 截断——保持输出始终是合法 JSON，
+// 面板按结构渲染而不是按截断的文本渲染。
+func archiveContext(body []byte) json.RawMessage {
+	var in struct {
+		System   any   `json:"system"`
+		Messages []any `json:"messages"`
+		Prompt   any   `json:"prompt"`
+	}
+	if json.Unmarshal(body, &in) != nil {
+		return nil
+	}
+	out := map[string]any{}
+	if in.System != nil {
+		out["system"] = in.System
+	}
+	if in.Prompt != nil {
+		out["prompt"] = in.Prompt
+	}
+	for len(in.Messages) > 0 {
+		out["messages"] = in.Messages
+		b, err := json.Marshal(out)
+		if err != nil {
+			return nil
+		}
+		if len(b) <= contextMaxBytes {
+			return b
+		}
+		if len(in.Messages) > 1 {
+			in.Messages = in.Messages[1:] // 丢最旧一轮，保留最近对话
+			continue
+		}
+		// 单条就超预算（贴了一大段代码）：把 content 截成串。非字符串（多模态块数组）
+		// 不再拆——整条返回，超出的由上游 context 上限决定，不在这里改结构。
+		if msg, ok := in.Messages[0].(map[string]any); ok {
+			if s, ok := msg["content"].(string); ok {
+				msg["content"] = logfmt.Truncate(s, contextMaxBytes/2) + "…（超长已截断）"
+				if b, err := json.Marshal(out); err == nil {
+					return b
+				}
+			}
+		}
+		break
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	// 没有 messages、只有超长 system / prompt（大段 system 提示词）时上面那条收敛路径
+	// 不触发，这里兜一次，否则单个事件能撑到几 MB 进归档。
+	if len(b) > contextMaxBytes {
+		for _, k := range []string{"system", "prompt"} {
+			if s, ok := out[k].(string); ok {
+				out[k] = logfmt.Truncate(s, contextMaxBytes/2) + "…（超长已截断）"
+			}
+		}
+		if b, err = json.Marshal(out); err != nil {
+			return nil
+		}
+	}
+	return b
 }
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
@@ -400,7 +601,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      t.path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)
@@ -412,6 +613,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		s := t.stat
 		e.Account = logfmt.Label(s.uid, s.nick)
 		e.Model = s.model
+		e.ModelEff = s.modelEff
+		e.Realm = s.realm
 		e.Outcome = s.outcome
 		e.TTFBMs = s.ttfb.Milliseconds()
 		e.Attempts = s.attempts
@@ -420,11 +623,22 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.TotalTokens = s.totalTokens
 		e.Credit = s.credit
 		e.HasCredit = s.hasCredit
-		e.CacheHitTokens = s.cacheHit
-		e.CacheMissTokens = s.cacheMiss
+		// 缓存命中/未命中（issue #92 同步）：hasCache 未置位时为零值，omitempty 省略。
+		e.CacheHitTokens = int64(s.cacheHit)
+		e.CacheMissTokens = int64(s.cacheMiss)
+		e.Mode = s.mode
+		e.ReasoningEffort = s.effort
+		e.ReasoningEffortRequested = s.effortReq
+		if s.think >= 0 {
+			e.ReasoningTokens = int64(s.think)
+		}
+		e.ToolsDeclared = s.toolsDeclared
+		e.ToolCalls = s.toolCalls
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.Context = t.context
+	e.ExecutorType = deriveExecutorType(t.userAgent)
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
@@ -473,10 +687,11 @@ const (
 	// 旧的 11 字节截断会把 "cn:deepseek-v4-flash" 切成 "cn:deepseek"，让人误以为是另一个模型。
 	chatModelWidth = 26
 	// chatAcctWidth 容纳 "昵称(uid8)"：中文昵称按 2 列/字算，5 字中文 + "(xxxxxxxx)" = 20 列。
-	chatAcctWidth = 22
-	chatTTFBWidth = 8
-	chatTokWidth  = 6
-	chatRateWidth = 11 // 形如 "183.6tok/s"
+	chatAcctWidth  = 22
+	chatTTFBWidth  = 8
+	chatTokWidth   = 6
+	chatRateWidth  = 11 // 形如 "183.6tok/s"
+	chatCacheWidth = 6  // 形如 "97%" / "-"
 )
 
 // logChatRow 打印一行请求级表格日志（输出 chatLogOut，无 log 时间戳前缀）。
@@ -486,38 +701,94 @@ const (
 //   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+//
+// logChatRow 旧形态（带缓存命中率、无请求 ID）；新代码请用 logChatRowFull。
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int, cacheHit, cacheMiss int, hasCache bool) {
+	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks, -1, cacheHit, cacheMiss, hasCache, "", "", 0, 0, false, "", "", 0, 0, "", "", "")
 }
 
-// logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
-// 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
+// logChatRowEx 带请求 ID、结果、重试、积分与调用来源字段的扩展形态；缓存列不传
+// （显示 "-"）；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
 	clientIP, userAgent string) {
+	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks, -1, 0, 0, false,
+		requestID, outcome, attempts, credit, hasCredit, clientIP, userAgent, 0, 0, "", "", "")
+}
+
+// logChatRowFull 是本文件唯一的行输出点：宽表字段 + 缓存列 + 可选请求 ID/结果/重试/积分尾段 + 调用来源段。
+//
+// effort 为生效档位、effortReq 为客户端原始档位（见 chatStat 字段注释）：
+// 两者相同只报 effort=；不同报 effort=max->high（客户端要什么、实际发出去什么
+// 一眼可见）；客户端关思考（off/none/disabled）时生效值被清空，报客户端原值
+// effort=off；连档位都没带时报 effort=-。
+func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
+	think int, cacheHit, cacheMiss int, hasCache bool,
+	requestID, outcome string, attempts int, credit float64, hasCredit bool,
+	clientIP, userAgent string, prep, do time.Duration, effort, effortReq, modelEff string) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
+	// 降级（model_eff 非空且与请求模型不同）时显示成 requested->effective——与 effort
+	// 的双值口径一致：一个字段两处取值对不上时，才需要把两端都摊开给人看。未降级保持
+	// 旧宽度。带箭头时允许超宽（同账号列：宁可该行变宽，不丢可辨性）。
+	if modelEff != "" && modelEff != model {
+		model = model + "->" + modelEff // 带箭头时允许超宽，不再截断补齐
+	} else {
+		model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
+	}
 	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
 	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
+		// 思考 token 单列：上游把思考算进 completion_tokens（实测 521 里 431 是思考），
+		// 不分开看就分不清「模型慢」和「模型在想」——Codex 这类高推理档流量尤其明显。
+		if think >= 0 {
+			tokField += fmt.Sprintf(" think=%d", think)
+		}
 		// 速率与用量账本走同一个函数（扣掉 TTFB）。此前这里自己除 total，漏扣首
-		// token 等待，于是控制台流水行的 tok/s 与面板数字对不上（issue #34）——
-		// 本函数本来就收到了 ttfb，只是没拿它算速率。
+		// token 等待，于是控制台流水行的 tok/s 与面板数字对不上（吸收上游 8b18ab8）
+		// ——本函数本来就收到了 ttfb，只是没拿它算速率。
+		// 无 TTFB 观测（非流式）时不报速率：分母含预填，读数不可比，留 "-"。
 		if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
 			tokpsField = fmt.Sprintf("%.1ftok/s", tps)
-		} else {
-			tokpsField = "0.0tok/s"
 		}
 	}
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
+	}
+	// 缓存命中率=hit/(hit+miss)。上游没给缓存字段时显示 "-"（不伪造 0%）。
+	cacheField := "-"
+	if hasCache && cacheHit+cacheMiss > 0 {
+		cacheField = fmt.Sprintf("%d%%", cacheHit*100/(cacheHit+cacheMiss))
+	}
+	// 分段耗时尾段（见 upstream.ChatTiming）：把 TTFB 拆成「本地准备 prep + 上游往返 do」。
+	// 只在本跳真测量过时输出——非流式/未启用留空，旧行格式不变。
+	split := ""
+	if do > 0 || prep > 0 {
+		split = fmt.Sprintf(" prep=%dms do=%dms", prep.Milliseconds(), do.Milliseconds())
+	}
+	// 思考档位（见 upstream.normalizeReasoningEffort）：每一行都给出，便于对照
+	// 「客户端要什么 / 网关实际发什么 / 根本没档位」三类情况：
+	//   - 降级：effort=max->high（issue #43：只报生效值会被读成客户端没发 max）
+	//   - 客户端关思考（off/none/disabled）：生效档位会被清空，显示客户端原值 effort=off
+	//   - 客户端没带、网关补齐了默认档：effort=- ->max（"-" 是客户端侧；别读成降级）
+	//   - 完全没档位：effort=-（网关关闭策略或模型不支持档位时就是这一种）
+	switch {
+	case effort != "" && effortReq != "" && !strings.EqualFold(effortReq, effort):
+		split += " effort=" + effortReq + "->" + effort
+	case effort != "" && effortReq != "":
+		split += " effort=" + effort
+	case effort != "":
+		split += " effort=- ->" + effort
+	case effortReq != "":
+		split += " effort=" + effortReq
+	default:
+		split += " effort=-"
 	}
 	extra := ""
 	if requestID != "" {
@@ -544,7 +815,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		}
 		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | cache=%s | total=%.1fs |%s%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -554,14 +825,16 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		logfmt.Pad(ttfbMS, chatTTFBWidth),
 		logfmt.Pad(tokField, chatTokWidth),
 		logfmt.Pad(tokpsField, chatRateWidth),
+		logfmt.Pad(cacheField, chatCacheWidth),
 		total.Seconds(),
+		split,
 		extra,
 		src,
 	)
 }
 
-// cacheMissSignal 低命中率告警信号（issue #92 P1 轻量化）：同一模型此前观测到过
-// 命中、本次大前缀（≥1000 tok）整段未命中（命中率 <10%）时打一条 WARN，每模型
+// cacheMissSignal 低命中率告警信号（issue #92 同步 P1 轻量化）：同一模型此前观测到
+// 过命中、本次大前缀（≥1000 tok）整段未命中（命中率 <10%）时打一条 WARN，每模型
 // 10 分钟冷却。只报「本可命中却重算」的可行动信号——新模型/新会话的首请求天然
 // 全 miss，不在此列。
 type cacheMissSignal struct {
@@ -595,6 +868,12 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	if miss <= 0 {
 		miss = prompt
 	}
+	// 判据是「重算占比」而非「hit 为 0」：上游会只报极小的重算量（实测 miss=3 /
+	// prompt=52703，命中率 99.99%），此时 hit=0 只说明本帧没有命中的 token，不代表
+	// 大前缀被整段重算（issue #170 假阳性，会淹没真告警）。
+	if miss*2 < prompt {
+		return
+	}
 	if !c.everHit[model] {
 		return
 	}
@@ -604,4 +883,32 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	}
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
+}
+
+func deriveExecutorType(ua string) string {
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "antigravity"):
+		return "AntigravityExecutor"
+	case strings.Contains(lower, "codex"):
+		return "CodexExecutor"
+	case strings.Contains(lower, "claude"):
+		return "ClaudeCodeExecutor"
+	case strings.Contains(lower, "cursor"):
+		return "CursorExecutor"
+	case strings.Contains(lower, "continue"):
+		return "ContinueExecutor"
+	case strings.Contains(lower, "asyncopenai") || strings.Contains(lower, "openai") || strings.Contains(lower, "python"):
+		return "OpenAIClient"
+	case strings.Contains(lower, "curl") || strings.Contains(lower, "http"):
+		return "HTTPClient"
+	default:
+		if ua != "" {
+			parts := strings.Split(ua, "/")
+			if len(parts) > 0 && len(parts[0]) <= 20 {
+				return parts[0] + "Executor"
+			}
+		}
+		return "WorkBuddyExecutor"
+	}
 }

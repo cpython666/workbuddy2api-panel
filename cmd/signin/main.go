@@ -9,9 +9,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 type row struct {
@@ -59,8 +60,8 @@ func main() {
 		r.uid, r.nick = a.UID, a.Nickname
 
 		// refresh 过期 token
-		if a.NeedsRefresh(2 * 3600) {
-			if err := up.RefreshToken(a); err != nil {
+		if a.NeedsRefresh(2 * time.Hour) {
+			if err := up.RefreshTokenIfNeeded(a, 2*time.Hour); err != nil {
 				if ue, ok := err.(*upstream.Error); ok && ue.Kind == upstream.ErrSessionDead {
 					r.status = "AUTH_INVALID"
 				} else {
@@ -72,7 +73,7 @@ func main() {
 				continue
 			}
 			// refresh 后写回文件（权限问题已修复）；落盘失败必须暴露，否则重启回旧 token
-			if err := a.SaveAtomic(); err != nil {
+			if err := a.SaveAtomicRetry(); err != nil {
 				log.Printf("signin %s save: %v", a.UID, err)
 			}
 		}
@@ -84,7 +85,7 @@ func main() {
 			okN++
 		default:
 			// DailyCheckin 已签到返回 code!=0 错误
-			if isAlready(err.Error()) {
+			if upstream.IsAlreadyCheckin(err) {
 				r.status = "ALREADY"
 				r.detail = short(err.Error())
 				alreadyN++
@@ -113,15 +114,6 @@ func main() {
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
-}
-
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
 }
 
 func trunc(s string, n int) string {

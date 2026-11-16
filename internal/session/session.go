@@ -16,9 +16,11 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/misakano7545/workbuddy2api-panel/internal/jsonscan"
+	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 )
 
 // entry 单条会话绑定。
@@ -205,8 +207,18 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+// CAS 语义：写锁内先核对绑定仍是入参 uid 才滚动。快路径从 RUnlock 到加写锁的
+// 窗口里，同一会话 key 的失败路径 Unbind、成功路径 Bind（粘性跟随最终成功号）、
+// 慢路径重分配都可能已改写绑定——无条件回写会把刚解绑的失败号复活、把粘性跟
+// 随的成功号冲回旧号，且镜像进 Redis 后连重启都恢复成错误绑定。uid 不匹配时
+// 放弃本次 touch（以先落地的显式操作为准）。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
+	e, found := r.entries[key]
+	if !found || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
@@ -336,6 +348,19 @@ func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+	// 快路径：单遍扫描读显式会话键（线上这条占 chat 请求 CPU 的 ~10%——此前
+	// 为了读 1~2 个短字符串，要把整个 100~500KB body 解析成 map）。
+	// 未命中时只有派生键一条路，那需要读消息内容，回落整树解析。
+	if key, hasUser, ok := explicitSessionKey(body); ok {
+		if key != "" {
+			return key
+		}
+		if hasUser {
+			// user 维度标识存在 → 不派生（anti-monopoly 契约），不必再看消息内容。
+			return ""
+		}
+	}
+	bodyParses.Add(1)
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
@@ -366,6 +391,35 @@ func ExtractKey(body []byte) string {
 	return deriveKey(obj)
 }
 
+// explicitSessionKey 单遍扫描读 5 个显式会话键（顺序与 ExtractKey 一致：
+// metadata 优先、snake 优先于 camel，prompt_cache_key 最后）。
+// ok=false 表示扫描器走不通，调用方必须回落整树解析。
+// 顺带读出 user_id 是否存在——派生回退闸要它，省掉一次整树解析。
+func explicitSessionKey(body []byte) (key string, hasUser bool, ok bool) {
+	res := jsonscan.Lookup(body, jsonscan.Query{
+		Top:        []string{"conversation_id", "conversationId", "prompt_cache_key", "user_id"},
+		Nested:     "metadata",
+		NestedKeys: []string{"conversation_id", "conversationId", "user_id"},
+	})
+	if !res.Ok {
+		return "", false, false
+	}
+	hasUser = res.Get("user_id") != "" || res.GetNested("user_id") != ""
+	switch {
+	case res.GetNested("conversation_id") != "":
+		return res.GetNested("conversation_id"), hasUser, true
+	case res.GetNested("conversationId") != "":
+		return res.GetNested("conversationId"), hasUser, true
+	case res.Get("conversation_id") != "":
+		return res.Get("conversation_id"), hasUser, true
+	case res.Get("conversationId") != "":
+		return res.Get("conversationId"), hasUser, true
+	case res.Get("prompt_cache_key") != "":
+		return res.Get("prompt_cache_key"), hasUser, true
+	}
+	return "", hasUser, true
+}
+
 // hasUserIDKey 报告已解析 body 是否携带 user 维度标识（metadata.user_id 或顶层
 // user_id，非空字符串才算）。只用于派生回退闸（ExtractKey）；解析失败按无处理。
 func hasUserIDKey(obj map[string]any) bool {
@@ -380,6 +434,26 @@ func hasUserIDKey(obj map[string]any) bool {
 // derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
 // 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
 const derivedKeyPrefix = "d-"
+
+// DeriveCacheKey 仅供 prompt_cache_key / X-Conversation-ID 的会话段使用：与
+// ExtractKey 的第 6 项同源（system + 首条 user 的哈希），但**不设 user_id 闸**。
+//
+// 为什么需要它：ExtractKey 对带 user_id 的请求返回空串，那是「不把 user 钉到某个账号」
+// 的契约（user 维度太粗）；但空串会让 prompt_cache_key 退化成**每账号一个常量槽**
+// （buildCacheKey(uid, "")），同一账号上所有对话互相覆盖前缀缓存——交错对话时每个
+// 切换点都是一次大前缀全 miss（实测上报：glm-5.3 120k 上下文周期性命中 0.2%）。
+// 缓存槽按对话隔离与账号绑定是两件事：本函数只影响前者，粘性绑定仍看 ExtractKey。
+func DeriveCacheKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	bodyParses.Add(1)
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	return deriveKey(obj)
+}
 
 // deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
 //
@@ -421,8 +495,22 @@ func deriveKey(obj map[string]any) string {
 	if firstUserText == "" {
 		return "" // 无用户消息：无从归属会话
 	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	// 掺入调用方（user_id）：键只由 system + 首条 user 决定时，不同下游用户的开场白
+	// 相同就会撞同一个键、被钉到同一个账号（#234）。掺入后不同用户不再合并，同一用户
+	// 的同一段对话仍然稳定 —— 这是把维度**加细**，不是退回「user 一维」。
+	sum := sha256.Sum256([]byte(callerIDOf(obj) + "\x00" + systemText + "\x00" + firstUserText))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// callerIDOf 请求侧能拿到的「谁在发」：metadata.user_id 优先，其次顶层 user_id。
+// 都没有返回空串（键与掺入前一致，老客户端零回归）。
+func callerIDOf(obj map[string]any) string {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["user_id"]); v != "" {
+			return v
+		}
+	}
+	return strOrEmpty(obj["user_id"])
 }
 
 // userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**
@@ -503,3 +591,14 @@ func strOrEmpty(v any) string {
 	s, _ := v.(string)
 	return s
 }
+
+// bodyParses 本包对请求体做整树 JSON 解析的次数（观测/回归用）。
+// ExtractKey / ResolveConversationID 在有显式会话键时必须 0 次——那时它们只需
+// 读一两个短字符串，整树解析 100~500KB 的 body 是纯浪费（线上占 chat CPU ~19%）。
+var bodyParses atomic.Int64
+
+// ParseCount 返回本包累计的整树解析次数（供测试与面板观测）。
+func ParseCount() int64 { return bodyParses.Load() }
+
+// ResetParseCount 归零计数（供测试）。
+func ResetParseCount() { bodyParses.Store(0) }

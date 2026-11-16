@@ -3,17 +3,23 @@
 package pool
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
+	mu    sync.RWMutex
+	byUID map[string]*entry
+	// rules 模型规则表（id → 规则）。面板「模型规则」页维护，随 state.json 落盘。
+	rules map[string]ModelRule
+	// parked 被账号目录热重载移出池的条目（uid → 原条目，见 ParkMany）。文件回来时原样复活，
+	// 禁用、暂停、分组、冷却都还在；随 state.json 的 parked_accounts 落盘，文件缺席期间重启也不丢。
+	parked  map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
@@ -37,6 +43,13 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// egress 出口级瞬时失败计数（egress.go，键 = 出口身份）。运行态，不持久化：
+	// 链路状态易失，重启后从零开始是正确的。
+	egress map[string]egressStat
+	// windows 额度窗口登记表（window.go）：429 带重置时刻时登记，到点主动发探针
+	// 让新一轮窗口从重置那一刻起算。**持久化**——进程内冷却表是易失的，窗口记录
+	// 跟着丢就等于每次重启都错过重置时刻，正是本机制要治的那段空转。
+	windows map[string]*ModelWindow
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -49,22 +62,57 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// creditFloorMaxRate 保底兜底允许的目录倍率上限（SetCreditFloorMaxRate 注入）。
+	// 语义：账本无观测（tier 1）时，目录倍率 ≤ 该值 → 放行（让便宜的新模型有机会
+	// 跑出第一笔实测入账）；> 该值 → 仍按收费模型拦（保住 kimi-k3-1 那类事故的防护）。
+	// 0 = 严格模式（任何已知正倍率都拦，即 PR #2 之前的现状）；负值非法保留原值。
+	creditFloorMaxRate float64
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
-	// 仅在持 p.mu 时由 floorBlockedForModel 调用；回调不得反向调用 Pool 方法。
+	// 仅在持 p.mu 时由 floorBlockedForRealmModel 调用；回调不得反向调用 Pool 方法。
 	modelRateOf func(realm, model string) string
+	// exclusiveModelOf 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）；
+	// exclusivePaidOf 报告 uid 是否付费号（第二返回值 false = 不知道）。
+	// 同为注入项、同为 nil = 关闭（缺省）。只在持锁时由 exclusiveBlockedForRealmModel 调用。
+	exclusiveModelOf func(realm, model string) bool
+	exclusivePaidOf  func(uid string) (bool, bool)
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// expiringWindow 快过期窗口（pool.expiring_soon，main 注入）。0 = 未注入 → 紧迫度
+	// 退回旧的固定倍率（见 expiringUrgency）。
+	expiringWindow time.Duration
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// balanceWindow 窗口用量调度窗口（issue #112，SetBalanceWindow 注入；默认 1h，
+	// 0 = 关闭）。按 (账号, 模型) 在本窗口内累计的 token 反比降权：只靠 credits
+	// 加权时余额掉几分与烧掉百万 token 在权重上几乎无差别，热点号会一路烧到 6004
+	// 限额而同期其他号闲置。软降权，不排除（保底/优先级/占比仍是硬语义，不受它影响）。
+	balanceWindow time.Duration
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// reserveCredits 保留积分阈值（SetReserveCredits 注入；0 = 关闭）。余额已知
+	// （creditsTotal > 0）且 credits <= 阈值 的账号停止接单——仍在池中、照常跑定时
+	// 任务（签到/猫猫旅行本身赚积分），充值后自动恢复。上游余额耗尽会发提醒短信，
+	// 设阈值即避免被用到 0。
+	reserveCredits int64
+	// reserveByRealm 按域覆盖 reserveCredits（issue #147；键 "cn"/"global"）。
+	// nil/空表 = 全部回落全局阈值。
+	reserveByRealm map[string]int64
+	// accountPriority 账号优先级（uid → 正整数，小 = 先消耗；SetAccountPriority 注入）。
+	// issue #62：配了的账号构成「先烧层」——层内有号可用时未配置的号一律不接单，
+	// 等价于「先把这批号的余额烧完，再换下一批」。硬过滤而非排序：排序只改抽签次序，
+	// 做不到「优先消耗某个账号的余额」。缺省 nil = 全部未配置（选号行为与旧版一致）。
+	accountPriority map[string]int
+	// accountShare 账号占比（uid → 相对权重，正数；SetAccountShare 注入）。
+	// issue #62：同一层内配了占比的账号独占抽签，按 share 归一化分流量（70/30 与
+	// 7/3 同义，不必凑满 100）。缺省 nil = 全部未配置（行为与旧版一致）。
+	accountShare map[string]float64
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -80,6 +128,14 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// strategy 选号策略（weighted / round_robin / sequential，见 strategy.go）。
+	// 空 = weighted（既有行为）。它只决定「同样合格的候选里选哪个」——健康、冷却、
+	// 在途、积分保底、成本分层、账号优先级全部先于它生效，策略无法绕过它们。
+	strategy string
+	// scheduling 策略游标：(realm, 模型) → 上次用到的账号。运行态不持久化
+	// （重启从环头重来，只影响下一次的起点，不影响正确性）。
+	scheduling map[string]scheduleCursor
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -93,6 +149,7 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		balanceWindow:      defaultBalanceWindow,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -100,6 +157,8 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		strategy:            StrategyWeighted,
+		scheduling:          map[string]scheduleCursor{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -186,11 +245,79 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 }
 
-// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
-func (p *Pool) SetPreferExpiring(enabled bool) {
+// SetReserveCredits 注入「保留积分」阈值（main 从 config 注入；0 = 关闭）。
+// 与 SetCostExploreInterval 同风格：0 是合法值（关闭默认），负值非法保留现值。
+// 不落 state.json——config 是事实源，重启由 main 重新注入。
+func (p *Pool) SetReserveCredits(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v < 0 {
+		return
+	}
+	p.reserveCredits = v
+}
+
+// SetReserveCreditsByRealm 注入按域覆盖表（issue #147；键 "cn"/"global"）。
+// nil/空表 = 全部回落全局阈值。config 校验已剔非法键与负值，这里不再防御。
+func (p *Pool) SetReserveCreditsByRealm(m map[string]int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reserveByRealm = m
+}
+
+// reserveThreshold 该域的保留积分阈值：按域覆盖优先，未写回落全局值。
+// 调用方须持锁；realm 为空当 "cn"（与 Auth.Realm 的归一化口径一致）。
+func (p *Pool) reserveThreshold(realm string) int64 {
+	if realm == "" {
+		realm = "cn"
+	}
+	if v, ok := p.reserveByRealm[realm]; ok {
+		return v
+	}
+	return p.reserveCredits
+}
+
+// SetPreferExpiring 注入最早到期优先路由开关与快过期窗口（main 从 config 解析后调用）。
+// window <= 0 = 未注入 → 紧迫度退回旧的固定倍率（不引入梯度），便于嵌入方/单测保持旧行为。
+func (p *Pool) SetPreferExpiring(enabled bool, window time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+	p.expiringWindow = window
+}
+
+// SetBalanceWindow 注入窗口用量调度窗口（issue #112）；d<=0 = 关闭。
+// 关掉后不再记账（NoteModelCost 跳过）也不再降权，与未引入本功能的旧版行为一致。
+func (p *Pool) SetBalanceWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.balanceWindow = d
+}
+
+// SetAccountPriority 注入账号优先级表（uid → 正整数，小 = 先消耗；issue #62）。
+// nil/空表 = 全部未配置，选号行为与未开此功能完全一致。非正值由 config 校验剔除。
+// 与 SetReserveCredits 同风格：不落 state.json——config 是事实源，重启由 main 重新注入。
+func (p *Pool) SetAccountPriority(m map[string]int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountPriority = m
+	// 静默失败是这类配置最坑的形态：uid 打错/字段名写错都不报错，只是"没生效"。
+	// 打一行键数，配合逐号状态里的 priority 字段（面板 /panel/api/accounts）即可
+	// 自证配置被读到且被匹配上。
+	if len(m) > 0 {
+		log.Printf("[pool] account_priority 已配置 %d 个账号（未配置的号在其后消费）", len(m))
+	}
+}
+
+// SetAccountShare 注入账号占比表（uid → 相对权重，正数；issue #62）。
+// nil/空表 = 全部未配置。占比在同一层内生效，先于「最早到期优先」（见 pick）。
+func (p *Pool) SetAccountShare(m map[string]float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountShare = m
+	if len(m) > 0 {
+		log.Printf("[pool] account_share 已配置 %d 个账号（同层内按归一化占比分流）", len(m))
+	}
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
@@ -227,15 +354,47 @@ func (p *Pool) SetCreditFloor(n int64) {
 	}
 }
 
+// SetExclusiveModels 注入「免费号调不通」的模型查表与账号付费状态查表
+// （main 用 upstream.Client.ModelExclusive / PaidUser 装配）。两者任一为 nil 即关闭闸门。
+//
+// 只在**知道**账号免费时才跳过：没观测过付费状态的号照旧参与（宁可按现状打一次上游，
+// 也不因为缺数据把能用的号排除）。
+func (p *Pool) SetExclusiveModels(modelOf func(realm, model string) bool, paidOf func(uid string) (bool, bool)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.exclusiveModelOf, p.exclusivePaidOf = modelOf, paidOf
+}
+
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。
 // 供积分保底兜底判定「未实测过的模型是否收费」——本地台账无观测时，不能因为
-// 「没学过」就放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
+// 「没学过」就无条件放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
 // 全池无观测 → 保底全部放行 → 两笔扣 111 分打穿到 0 并硬冷却到次日 04:00）。
 // fn 可为 nil（清注入）；回调只在持 p.mu 时被调用，不得反向调用 Pool 方法。
 func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.modelRateOf = fn
+}
+
+// SetCreditFloorMaxRate 注入保底兜底允许的目录倍率上限（config pool.credit_floor_max_rate）。
+//
+// 解决两头堵：全额拦（旧行为）会让便宜的新模型在触底号上永远跑不出第一笔账本；
+// 全额放（PR #2）会把 kimi-k3-1 那类高价模型的事故防护一起删掉。按倍率分档后
+// 便宜模型（如 x0.11）能入账，贵的（x1.62）仍拦。0 = 严格模式（等于旧行为）。
+// 负值非法保留原值。
+func (p *Pool) SetCreditFloorMaxRate(v float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v >= 0 {
+		p.creditFloorMaxRate = v
+	}
+}
+
+// CreditFloorMaxRate 透出生效的倍率上限（面板/status 用）。0 = 严格模式。
+func (p *Pool) CreditFloorMaxRate() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creditFloorMaxRate
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。
@@ -339,6 +498,25 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.upsertLocked(a)
 }
 
+// AuthFor 返回账号凭证指针（只读用途：发起内部请求，如额度窗口探针）。
+//
+// 为什么需要它：池对外只给 Status（纯展示数据），而「用某个具体账号发一个最小请求」
+// 需要 *auth.Auth 本体。返回指针而非拷贝是刻意的——refresh 会就地改写 token，拷贝
+// 会让调用方拿着过期凭证打上游。
+//
+// 调用方**不得**修改返回值的可导出字段（除 auth 自带的加锁方法外）；uid 不存在返回 nil。
+func (p *Pool) AuthFor(uid string) *auth.Auth {
+	if uid == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.a
+	}
+	return nil
+}
+
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
@@ -356,9 +534,48 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			changed = true
 		}
 	}
-	if changed {
-		p.saveLocked()
+	if changed && !p.saveLocked() {
+		p.dirty.Store(true) // 剔除结果没落盘：交给 flusher 重试，否则已删账号下次启动复活
 	}
+}
+
+// InFlight 返回某账号当前在途请求数（不存在/已删除返回 0）。
+//
+// 热重载剔除账号前用它做一次「真的没人用」检查：把在途请求的账号从池里拿掉，
+// 那条请求收尾时 Release 会对已删条目变成 no-op，计费/日志都还算得上，但面板上
+// 会出现「账号消失时还有流量」。宁可下一轮扫描再删。
+func (p *Pool) InFlight(uid string) int64 {
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return e.inFlight.Load()
+}
+
+// RemoveMany 批量剔除账号并只落盘一次；返回实际剔除的 uid。热重载用。
+//
+// 与逐个 Remove 的差别：一次 saveLocked，避免 N 个账号批量消失时写 N 次 state.json。
+// 不在池里的 uid 静默忽略（并发下另一个调用可能已经删过）。
+func (p *Pool) RemoveMany(uids []string) []string {
+	if len(uids) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var removed []string
+	for _, uid := range uids {
+		if _, ok := p.byUID[uid]; !ok {
+			continue
+		}
+		delete(p.byUID, uid)
+		removed = append(removed, uid)
+	}
+	if len(removed) > 0 && !p.saveLocked() {
+		p.dirty.Store(true)
+	}
+	return removed
 }
 
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
@@ -384,7 +601,73 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
+	if e, ok := p.parked[a.UID]; ok {
+		// 热重载移出过的号回来了：沿用原条目，人工设的禁用/暂停/分组不因文件挪开一阵就丢。
+		delete(p.parked, a.UID)
+		e.a = a
+		p.byUID[a.UID] = e
+		p.dirty.Store(true)
+		return
+	}
 	p.byUID[a.UID] = &entry{a: a}
+}
+
+// maxParked 暂存条目上限：外部脚本反复轮换大批账号时不让内存无界增长；满了就不再暂存（照旧删）。
+const maxParked = 4096
+
+// ReconcileResult Reconcile 对单个账号做了什么。
+type ReconcileResult int
+
+const (
+	ReconcileUnchanged ReconcileResult = iota // 池里已有且磁盘上的令牌不比内存新
+	ReconcileAdded                            // 新入池（含从暂存复活）
+	ReconcileUpdated                          // 池里已有，换上了磁盘上更新的令牌
+)
+
+// Reconcile 账号目录热重载的入池：新号加入；已在池的号只在磁盘令牌更新时原地更新
+// （auth.AdoptNewer），不换指针——换指针会把刚刷新的令牌盖回磁盘上的旧值。
+//
+// 原地更新在 p.mu 之外做：auth 的锁不嵌在池锁里，不引入新的锁序。
+func (p *Pool) Reconcile(a *auth.Auth) ReconcileResult {
+	p.mu.Lock()
+	e, ok := p.byUID[a.UID]
+	if !ok {
+		p.upsertLocked(a)
+		p.mu.Unlock()
+		return ReconcileAdded
+	}
+	cur := e.a
+	p.mu.Unlock()
+	if cur.AdoptNewer(a) {
+		return ReconcileUpdated
+	}
+	return ReconcileUnchanged
+}
+
+// ParkMany 把账号移出池并暂存其状态（热重载用），只落盘一次；返回实际移出的 uid。
+// 与 RemoveMany 的差别只在暂存：面板手动删除是「不要了」，热重载删除是「文件暂时不见了」。
+func (p *Pool) ParkMany(uids []string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var removed []string
+	for _, uid := range uids {
+		e, ok := p.byUID[uid]
+		if !ok {
+			continue
+		}
+		delete(p.byUID, uid)
+		if len(p.parked) < maxParked {
+			if p.parked == nil {
+				p.parked = map[string]*entry{}
+			}
+			p.parked[uid] = e
+		}
+		removed = append(removed, uid)
+	}
+	if len(removed) > 0 && !p.saveLocked() {
+		p.dirty.Store(true)
+	}
+	return removed
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

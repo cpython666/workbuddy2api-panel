@@ -10,28 +10,67 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	_ "net/http/pprof" // WB2API_PPROF 打开时提供 /debug/pprof（默认无监听）
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/misakano7545/workbuddy2api-panel/internal/alert"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
+	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
+	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
+	"github.com/misakano7545/workbuddy2api-panel/internal/server"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
+	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+// appVersion 面板版本，透出到 /panel/api/overview。
+// 本地构建保持 dev。发布构建由 CI 用 -X 注入上海时间（2026.9.26.711），不跟上游 1.x。
+var appVersion = "dev"
+var appRepository = "misakano7545/workbuddy2api-panel"
+
+// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
+// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（显式配成
+// "0.0.0.0:7863" 或 ":7863"）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
+// 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
+// 显式清空」的最后提醒，不阻塞启动。
+func insecureKeyWarning(listen, apiKey string) string {
+	if apiKey != "" && apiKey != "test_key" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen // 非 host:port 形态：按具名地址保守处理（继续告警）
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		// 空 host = 所有网卡，维持告警
+	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
+		return "" // 只听回环：暴露面有限，不打扰
+	}
+	what := "为空（网关与面板完全不鉴权）"
+	if apiKey != "" {
+		what = "为样例占位符 test_key"
+	}
+	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
+}
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -48,8 +87,19 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
+	if handled, err := updater.HandleSelfUpdate(os.Args); handled {
+		if err != nil {
+			log.Printf("[updater] %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+	// 实际生效的配置路径。必须在 flag.Parse() **之后**取值：flag.String 返回的指针
+	// 在 Parse 时才写入命令行值，此前取到的是默认值拷贝，-config 自定义路径时横幅
+	// 会报一份根本没读的文件。下面退回「默认+env」时清空，同理（issue #155）。
+	loadedFrom := *cfgPath
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -64,6 +114,7 @@ func main() {
 			if err != nil {
 				// 生成失败（目录只读等）：退回纯默认 + env（旧行为兜底），不阻塞启动。
 				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", *cfgPath, err)
+				loadedFrom = ""
 				cfg, err = Load("")
 			}
 		}
@@ -100,9 +151,17 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetBalanceWindow(cfg.BalanceWindowDur)             // 窗口用量调度（issue #112，默认 1h；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
-	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额低于阈值停止接单（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(cfg.Pool.ReserveCreditsByRealm)
+	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
+	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
+	p.SetAccountShare(cfg.Pool.AccountShare)
+	// 选号策略（pool.selection_strategy）：weighted 缺省 / round_robin / sequential。
+	p.SetStrategy(cfg.Pool.SelectionStrategy)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -133,12 +192,47 @@ func main() {
 
 	up := upstream.New()
 
+	// 出站 ClientHello 指纹档位：默认 node（复刻官方 Node/OpenSSL 的 JA3/JA4）。
+	// 配 go 才退回 crypto/tls 原生形态——唯一用途是指纹导致握手异常时紧急回滚。
+	if err := up.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
+		log.Fatalf("CONFIG: %v", err)
+	}
+	if up.TLSFingerprint == upstream.TLSFingerprintNode {
+		log.Printf("[upstream] TLS 指纹复刻已启用（JA3 %s / JA4 %s）",
+			upstream.OfficialJA3MD5, upstream.OfficialJA4)
+	} else {
+		log.Printf("[upstream] TLS 指纹为原生 Go 形态（JA3/JA4 与官方客户端不一致）")
+	}
+
+	// 3D 临时云凭证：手工表（features.three_d_temp_tokens）优先，自动签发兜底
+	// （features.three_d_auto_token，默认 true——用账号自己的 access token 调官方
+	// /v2/api-keys 换 ck_t_，协议见 internal/upstream/three_d_credential.go）。
+	// 两条路径都拿不到时 3D 链路在发请求前就回 503。凭证内容不进日志。
+	static3D := configureThreeDCredentials(up, cfg)
+	if static3D.Empty() && cfg.Features.ThreeDEnabled {
+		if cfg.Features.ThreeDAutoToken {
+			log.Printf("[3d] 已开启 features.three_d_enabled：临时凭证将用账号 access token 自动签发（features.three_d_auto_token=true）")
+		} else {
+			log.Printf("[3d] 已开启 features.three_d_enabled，但没有配置 features.three_d_temp_tokens 且自动签发已关闭；" +
+				"3D 请求会回 503 three_d_credential_missing")
+		}
+	}
+
+	// 出站 DNS（config dns_servers / WB2A_DNS）：显式指定解析器，绕开系统配置。
+	// 典型场景是 Android（无 /etc/resolv.conf，Go 解析器退回 [::1]:53 全域名失败）
+	// 与本地 DNS 被污染。未配置时保持系统解析器，行为零变化。
+	if len(cfg.DNSServers) > 0 {
+		up.SetDNSDialer(upstream.NewDNSDialer(cfg.DNSServers))
+	}
+
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
 	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
 	// 位于 up 装配之后：倍率表由探测下发，闭包每次调用读实时快照。
 	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
-
+	// 「免费号调不通」的模型（modelTiers accessMode=exclusive）：知道账号免费就不派给它。
+	// 付费状态来自 billing summary 的 IsPaidUser（顺手记在 upstream 里），没观测过就放行。
+	p.SetExclusiveModels(up.ModelExclusive, up.PaidUser)
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -148,7 +242,40 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	proxies, err := proxypool.New(stateSibling(cfg.StateFile, "proxy-pool.json"),
+		up.HTTP.Transport.(*http.Transport), upstream.NewDNSDialer(cfg.DNSServers))
+	if err != nil {
+		log.Fatalf("proxy pool: %v", err)
+	}
+	defer proxies.Close()
+	proxies.SetTLSOver(up.TLSOver) // 经代理的 HTTPS 与直连同一指纹、同一请求头顺序
+	// 出口画像（国家 / 住宅或机房 / ISP）：缺省关闭，打开后随健康探测经该代理顺手查，不参与选号。
+	proxies.SetExitLookup(cfg.Features.ProxyExitLookup)
+	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(cfg.Prompt.KeepRecentRounds))
+	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
+	up.SetEffortPolicy(effortPolicyOf(cfg))
+	if cfg.Thinking.Enabled {
+		priority := "客户端优先（只在缺档时补默认档）"
+		if !cfg.Thinking.ClientPriority {
+			priority = "网关优先（改写客户端档位）"
+			if cfg.Thinking.OverrideScope == "all" {
+				priority = "网关优先（档位与关闭意图一起覆盖）"
+			}
+		}
+		log.Printf("思考档位策略：默认档 %s；%s", cfg.Thinking.DefaultEffort, priority)
+	} else {
+		log.Printf("思考档位策略已关闭（不补档、不改写客户端档位）")
+	}
+	if cfg.Features.SanitizeBlacklistFingerprints {
+		if cfg.Features.SanitizeBrandScope == "identity" {
+			log.Printf("指纹脱敏已启用；品牌词规则仅作用于 system/developer（features.sanitize_brand_scope=identity）")
+		} else {
+			log.Printf("指纹脱敏已启用；品牌词规则作用于所有消息角色（features.sanitize_brand_scope=all）")
+		}
+	}
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -158,17 +285,28 @@ func main() {
 	up.ClientName = cfg.Upstream.ClientName
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	up.DumpDir = cfg.Upstream.DumpDir
+	up.DumpRequestMax = cfg.Upstream.DumpMaxBytes
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
 	up.ChatBaseGlobal = cfg.Global.ChatBase
 	up.BillingBaseGlobal = cfg.Global.BillingBase
+	applyCNChatBase(up, cfg)
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+
+	// 余额采样记录器：与 state 文件同目录（路径由 state 推出，不加配置项）。
+	// 采样动作挂在余额刷新之后（见 internal/scheduler），这里只管装配与落盘生命周期。
+	balPath := stateSibling(cfg.StateFile, "balance_history.json")
+	bal := balance.New(balPath)
+	bal.Start()
+	defer bal.Stop()
+	log.Printf("[balance] 余额趋势采样已启用: %s 每 %v 一点（%s）", balPath, balance.Interval(), bal.Describe())
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
@@ -177,18 +315,27 @@ func main() {
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
+		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
-		ExpiringSoonWindow: cfg.ExpiringSoonDur,
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
-		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		ExpiringSoonWindow:  cfg.ExpiringSoonDur,
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		WebActivityDisabled: !cfg.Schedule.WebActivityEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		GrowthDisabled:      !cfg.Schedule.GrowthEnabled,
+		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
+		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		JitterMinutes:          cfg.Schedule.JitterMinutes,
+		// 账号级摊开（issue #45）：默认 0/0 = 关闭，同一秒打全池。
+		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
+		// 启动补跑去重：与 state.json 同目录，重启多次只在当天补一轮。
+		RunStampFile: filepath.Join(filepath.Dir(cfg.StateFile), "task-runs.json"),
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -214,16 +361,37 @@ func main() {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
 	switch {
-	case !cfg.Schedule.BlackcatEnabled:
-		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
+	case !cfg.Schedule.GrowthEnabled:
+		log.Printf("成长任务队列已禁用（schedule.growth_enabled=false）")
 	default:
-		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
+		log.Printf("成长任务队列已启用：%v 点（每日自动跑一遍任务中心待办，账号间并发 %d）",
+			cfg.Schedule.GrowthHours, cfg.Schedule.GrowthConcurrency)
+	}
+	if cfg.Schedule.JitterMinutes > 0 {
+		log.Printf("排程抖动：各任务在名义整点后 0-%d 分钟（schedule.jitter_minutes）", cfg.Schedule.JitterMinutes)
+	}
+	if cfg.Schedule.AccountSpreadMinutes > 0 {
+		log.Printf("账号摊开：账号遍历型任务在 %d 分钟内按账号错开，最小间隔 %d 秒（schedule.account_spread_minutes）",
+			cfg.Schedule.AccountSpreadMinutes, cfg.Schedule.AccountSpreadMinGapSeconds)
 	}
 	switch {
 	case !cfg.Schedule.BalanceRefreshEnabled:
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	}
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
+	}
+	if !cfg.Schedule.WindowProbeEnabled {
+		log.Printf("额度窗口探针已禁用（schedule.window_probe_enabled=false）")
+	}
+	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
+		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
+			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
 	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
@@ -232,11 +400,30 @@ func main() {
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	// 模型白名单（issue #68）：启动时归一化一次，快照只读持有。
+	allowedModels, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		APIKey:                cfg.APIKey,
+		SoftCooldown:          cfg.SoftRateDur,
+		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     cfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: cfg.Features.WatermarkStripEnabled,
+		ThreeDEnabled:         cfg.Features.ThreeDEnabled,
+		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		RecordContext:         cfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
+		AllowedModels:    allowedModels,
+		AllowlistEnabled: allowlistEnabled,
+		ModelAliases:     livecfg.NormalizeModelAliases(cfg.Models.Aliases),
+		// 模型降级路由表（pool.model_fallback）：6004 限流时同账号改用等价模型。
+		ModelFallback: cfg.Pool.ModelFallback,
+		// 思考档位策略镜像：面板「模型与档位」页的「网关档位」列据此显示当前生效值。
+		ThinkingEnabled:        cfg.Thinking.Enabled,
+		ThinkingDefaultEffort:  cfg.Thinking.DefaultEffort,
+		ThinkingClientPriority: cfg.Thinking.ClientPriority,
+		ThinkingOverrideScope:  cfg.Thinking.OverrideScope,
+		ThinkingModelDefaults:  cfg.Thinking.ModelDefaults,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -262,18 +449,41 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
-	pn := panel.New(panel.Config{
-		Pool:        p,
-		Usage:       rec,
-		RequestLog:  requestLog,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Live:        live,
+	var gw *server.Handler
+	// configSaveMu 串行化面板配置保存（并发两次保存会在读-改-写文件与热应用之间互踩）。
+	var configSaveMu sync.Mutex
+	// pn 先声明再赋值：SaveConfig 闭包要在同一条语句里捕获它（:= 的作用域从语句结束才开始）。
+	// 积分历史：把每次真实查到的余额与上一次比对，变动即留痕（新账号首次只建
+	// 基线）。挂载在余额查询路径上（upstream 的余额观察者），签到 / 活跃上报 /
+	// 旅行 / 保活 / 面板手动刷新全覆盖——上游只在少数渠道落金额日志，比对余额
+	// 是唯一可靠的口径。与 state/usage/request-logs 同目录，随 state_file 搬移。
+	creditHist := credithist.New(stateSibling(cfg.StateFile, "credit-history.json"), 2000)
+	up.SetCreditObserver(creditHist.Observe)
+	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
+
+	updateManager := updater.New(appVersion, appRepository, *cfgPath, updateSettingsFrom(cfg))
+	var pn *panel.Panel
+	pn = panel.New(panel.Config{
+		Pool:       p,
+		ProxyPool:  proxies,
+		Usage:      rec,
+		RequestLog: requestLog,
+		Upstream:   up,
+		Scheduler:  sch,
+		// 降级路由表：面板据此在限流提示里标注「已路由至 <等价模型>」。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
+		// 余额趋势采样记录器：nil 时该视图返回 501。
+		Balance: bal,
+		// 后台任务的自动触发开关与成长任务排程共用热配置（schedule.growth_enabled）。
+		AutoTasksEnabled: sch.GrowthEnabled,
+		AuthDir:          cfg.AuthDir,
+		APIKey:           cfg.APIKey,
+		RedisMode:        redisMode,
+		StickyCount:      sessCount,
+		Version:          appVersion,
+		Updater:          updateManager,
+		PollIntervalSec:  cfg.Panel.PollIntervalSec,
+		Live:             live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -282,16 +492,68 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			configSaveMu.Lock()
+			defer configSaveMu.Unlock()
+			fields, err := saveConfig(raw, *cfgPath, live, p, up, sch, gw, pn, cfg)
+			if err != nil {
+				return nil, err
+			}
+			if saved, loadErr := Load(*cfgPath); loadErr == nil {
+				updateManager.Configure(updateSettingsFrom(saved))
+			} else if loadErr != nil {
+				log.Printf("WARN: reload update settings: %v", loadErr)
+			}
+			return fields, nil
 		},
+		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
+		CreditHistory: creditHist,
 	})
-	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
-	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
-	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	// 面板运行日志全频道按天落盘（logging.panel_log_*）：重启后回填、支持按区间导出。
+	// 装配顺序必须在 log.SetOutput 之前——回填完再把实时输出接上，否则启动期的
+	// 那几行会先入环、再被回填的历史插到前面，时间序就乱了。
+	var panelLogs *panel.LogStore
+	if cfg.Logging.PanelLogEnabled {
+		panelLogs = panel.NewLogStore(stateSibling(cfg.StateFile, "panel-logs"),
+			cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		if panelLogs == nil {
+			log.Printf("WARN: 面板日志落盘不可用（数据目录建不出来），退回纯内存环")
+		} else {
+			if err := pn.Logs().SetLogStore(panelLogs); err != nil {
+				log.Printf("WARN: 面板日志回填失败（不影响新日志）: %v", err)
+			}
+			defer panelLogs.Close()
+			log.Printf("[panel] 运行日志落盘 %s（保留 %d 天，上限 %d MiB）",
+				panelLogs.Dir(), cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		}
+	}
+	// 兜底：落盘关掉或不可用时，仍用任务频道那份 JSON 快照回填（旧行为）。
+	if panelLogs == nil {
+		if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {
+			log.Printf("WARN: task log archive: %v", err)
+		}
+	}
+	// 日志落盘在 Ring 的后台 goroutine 里做：退出前把排队的行写完（先于上面的 panelLogs.Close 执行）。
+	defer pn.Logs().Flush()
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	// 成长任务队列排程的执行体在面板（队列逻辑唯一实现）：注入回调，避免 scheduler → panel 循环依赖。
+	sch.SetGrowthRunner(pn.RunGrowthQueueNow)
+	sch.SetSweepRunner(pn.RunTaskSweepNow)
+	pn.SetGrowthConcurrency(cfg.Schedule.GrowthConcurrency)
 
-	h := server.NewHandler(server.Config{
+	var auditLog *server.AuditLog
+	if cfg.Admin.AuditEnabled {
+		al, aerr := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
+		if aerr != nil {
+			p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退，否则丢整轮运行状态
+			log.Fatalf("admin audit: %v", aerr)
+		}
+		auditLog = al
+		log.Printf("admin audit: %s", al.Path())
+	}
+	// MCP serverInfo.version 与面板 /status 用同一个版本串（本地构建是 dev）。
+	server.BuildVersion = appVersion
+	gw = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
@@ -304,18 +566,105 @@ func main() {
 		Usage:        rec,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		// 模型降级路由表：读 live 快照（支持面板热更，改完即生效、无需重启）。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
+		PromptText:    cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordContext:    cfg.Logging.RequestArchiveContext,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
+		// Live 为 nil 的裸用/测试路径。
+		ModelsHidden: cfg.Models.Hidden,
+		// 模型白名单原始条目（issue #68）；同上，运行期以 livecfg 快照为准。
+		ModelsAllowed: cfg.Models.Allowed,
+		// 模型映射原始条目（issue #30）；同上，运行期以 livecfg 快照为准。
+		ModelsAliases:  cfg.Models.Aliases,
+		AdminEnabled:   cfg.Admin.Enabled,
+		MetricsEnabled: cfg.Metrics.Enabled,
+		// 3D 开关的静态回退（运行期以 livecfg 快照为准，热生效）。
+		ThreeDEnabled:    cfg.Features.ThreeDEnabled,
+		Tasks:            sch,
+		Audit:            auditLog,
+		BudgetLimit:      cfg.Budget.DailyCreditLimit,
+		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
+		CacheLowRate:     cfg.Budget.CacheLowRate,
+		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处都只在启动时读，改完需重启）。
+		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
+		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		// 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive，缺省 1.5s）。
+		HeadKeepalive: cfg.HeadKeepaliveDur,
+		// 6020/6021 渠道排队：网关内先等一轮（features.busy_retry / busy_wait_seconds）。
+		BusyRetry:   cfg.Features.BusyRetry,
+		BusyWaitMax: time.Duration(cfg.Features.BusyWaitSeconds) * time.Second,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	proxyCtx, stopProxies := context.WithCancel(ctx)
+	proxyDone := make(chan struct{})
+	go func() {
+		defer close(proxyDone)
+		proxies.Run(proxyCtx)
+	}()
+	defer func() { stopProxies(); <-proxyDone }()
+	updateManager.SetRestart(stop)
+	go updateManager.Run(ctx)
+	// 账号目录热重载（issue #199）：外部同步进来的 auths/*.json 不必重启进程即可入池，
+	// 删文件也会在连续 N 次扫描确认后出池。面板「刷新」按钮之外还提供
+	// POST /panel/api/accounts/reload 给脚本用；间隔 0s 时只保留手动接口。
+	pn.SetReloadConfig(cfg.ReloadIntervalDur, cfg.Accounts.ReloadDeleteConfirm)
+	go pn.ReloadLoop(ctx.Done())
+	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
+	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
+		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
+		log.Fatalf("task jobs: %v", err)
+	}
+	defer pn.StopTaskJobs()
+	pn.ResumeTaskJobs()
 	go sch.Run(ctx)
+	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
+	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针：上游按首次请求起算额度窗口，429 重置时刻到了没人发请求窗口就
+	// 不开始（额度空转）。到点主动发一个最小请求把起点钉住。开关见
+	// schedule.window_probe_enabled（缺省开）。
+	if cfg.Schedule.WindowProbeEnabled {
+		sch.StartModelWindowProbe(ctx)
+	}
+	if cfg.Alerting.Enabled {
+		mon := alert.New(alert.Config{
+			Enabled:          true,
+			WebhookURL:       cfg.Alerting.WebhookURL,
+			Secret:           cfg.Alerting.Secret,
+			Interval:         time.Duration(cfg.Alerting.IntervalSeconds) * time.Second,
+			Timeout:          time.Duration(cfg.Alerting.TimeoutSeconds) * time.Second,
+			StartupGrace:     time.Duration(cfg.Alerting.StartupGraceSeconds) * time.Second,
+			MinHealthyCN:     cfg.Alerting.MinHealthyCN,
+			MinHealthyGlobal: cfg.Alerting.MinHealthyGlobal,
+			RecoverHealthy:   cfg.Alerting.RecoverHealthy,
+			BreakerThreshold: cfg.Alerting.BreakerThreshold,
+			ForTicks:         cfg.Alerting.ForTicks,
+			ClearTicks:       cfg.Alerting.ClearTicks,
+			SendResolve:      cfg.Alerting.SendResolve,
+		}, alertSource{pool: p, h: gw})
+		go mon.Run(ctx)
+		// 排程轮次结果汇总的推送出口（告警 webhook 同一条管道；未启用则只落面板日志）。
+		pn.SetNotifier(mon.Notify)
+		log.Printf("alerting: webhook on, every %ds", cfg.Alerting.IntervalSeconds)
+		// 上游目录改版监控也走这条管道（未启用告警时只写日志，见下方 watchdog 段）。
+		if cfg.Watchdog.Enabled {
+			go gw.WatchCatalog(ctx, time.Duration(cfg.Watchdog.IntervalSeconds)*time.Second, mon.Notify)
+			log.Printf("watchdog: 上游目录监控开，每 %ds", cfg.Watchdog.IntervalSeconds)
+		}
+	} else if cfg.Watchdog.Enabled {
+		// 没有 webhook 也要能开：变化只写日志（面板任务日志里能翻到）。
+		go gw.WatchCatalog(ctx, time.Duration(cfg.Watchdog.IntervalSeconds)*time.Second, nil)
+		log.Printf("watchdog: 上游目录监控开（未配置 alerting，仅写日志），每 %ds", cfg.Watchdog.IntervalSeconds)
+	}
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -325,9 +674,21 @@ func main() {
 	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
 	go warmModelRates(ctx, up, p)
 
+	// 诊断用：WB2API_PPROF=127.0.0.1:6060 时另起一个只跑 pprof 的监听。
+	// 默认不开启（不设环境变量就完全没有这个监听），供「并发一高就降速」这类
+	// 只能靠真实负载定位的 CPU 问题取 profile（取完即关容器，不常驻生产）。
+	if addr := os.Getenv("WB2API_PPROF"); addr != "" {
+		go func() {
+			log.Printf("[pprof] 诊断监听开启 %s（CPU: /debug/pprof/profile?seconds=30）", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Printf("WARN: [pprof] 监听失败 %v", err)
+			}
+		}()
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           gw,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
 		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
@@ -340,17 +701,34 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 在途请求排干窗口可配（server.shutdown_timeout，缺省 30s）：长流式 SSE
+		// 合法时长可达分钟级，固定 5s 必然把在途请求掐成连接重置；超时不再静默。
+		shutdownTimeout := cfg.ShutdownTimeoutDur
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 5 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WARN: 优雅关停未在 %s 内完成，在途请求被放弃: %v", shutdownTimeout, err)
+		}
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
+	log.Print(listenBanner(cfg.Listen, loadedFrom, cfg.APIKey))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		p.Flush() // 监听失败时信号路径不会跑：这里同样兜底落盘再退
 		log.Fatalf("http: %v", err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
 	}
 	log.Printf("bye")
 }
@@ -395,6 +773,37 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 }
 
+// listenBanner 组装启动横幅。api_key 的来源必须写明（issue #155：改了 config.json 却不
+// 生效，旧日志只写 api_key=true，看不出是 WB2A_API_KEY 覆盖了文件还是改错了文件），
+// 密钥本身只出掩码。path 传「实际加载的那份」，退回默认时传空。
+func listenBanner(listen, path, key string) string {
+	return fmt.Sprintf("workbuddy2api listening on %s (api_key=%s, 来源 %s)，管理面板 http://127.0.0.1%s/panel/",
+		listen, maskSecret(key), apiKeySource(path), panelListenPath(listen))
+}
+
+// apiKeySource 报生效的 api_key 来自哪里，顺序同 applyEnv：env 非空即覆盖文件。
+func apiKeySource(path string) string {
+	if os.Getenv("WB2A_API_KEY") != "" {
+		return "环境变量 WB2A_API_KEY"
+	}
+	if path == "" {
+		return "内置默认值"
+	}
+	return "配置文件 " + path
+}
+
+// maskSecret 只留首尾各两位便于对号入座；不足 8 位或未设置则整条隐去。
+func maskSecret(s string) string {
+	if s == "" {
+		return "(未设置)"
+	}
+	r := []rune(s)
+	if len(r) < 8 {
+		return strings.Repeat("*", len(r))
+	}
+	return string(r[:2]) + strings.Repeat("*", len(r)-4) + string(r[len(r)-2:])
+}
+
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
 // （":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回）。
 func panelListenPath(listen string) string {
@@ -406,11 +815,22 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
+// configureThreeDCredentials 装配一次 3D 凭证来源；自动开关的变化需要重启。
+func configureThreeDCredentials(up *upstream.Client, cfg *Config) *upstream.StaticThreeDCredentials {
+	static := upstream.NewStaticThreeDCredentials(cfg.Features.ThreeDTempTokens)
+	if cfg.Features.ThreeDAutoToken {
+		up.ThreeDCredential = upstream.NewAutoThreeDCredentials(up.FetchClientTempKey, static)
+	} else {
+		up.ThreeDCredential = static
+	}
+	return static
+}
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring（含快过期窗口）/SetAccountPriority/SetAccountShare/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -419,11 +839,77 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+// writeConfigInPlace 原地重写配置（O_TRUNC），给两种「原子替换做不到」的部署形态复用：
+// 单文件 bind mount 不能被 rename 覆盖（EBUSY）；配置目录不可写但文件可写（EACCES，
+// Docker 以 PUID 运行而 /app 属主是镜像内的 app，见 issue #134）。代价是失去原子性：
+// 写失败时文件可能只剩半截 —— 这两种形态下本来也没有可用 tmp 的目录。
+func writeConfigInPlace(path string, out []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(out)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
+}
+
+// effortPolicyOf 把 config thinking 节转成 upstream 运行时策略。nil 配置/
+// 未启用时返回的策略由 Client.SetEffortPolicy 统一处理（Enabled=false 即不生效）。
+func effortPolicyOf(cfg *Config) *upstream.EffortPolicy {
+	if cfg == nil {
+		return nil
+	}
+	return &upstream.EffortPolicy{
+		Enabled:        cfg.Thinking.Enabled,
+		DefaultEffort:  cfg.Thinking.DefaultEffort,
+		ClientPriority: cfg.Thinking.ClientPriority,
+		OverrideScope:  cfg.Thinking.OverrideScope,
+		ModelDefaults:  cfg.Thinking.ModelDefaults,
+	}
+}
+
+// updateSettingsFrom 把 config 的 update 段翻成 updater.Settings（issue #198）。
+//
+// 单独抽成函数是因为「启动装配」与「配置保存后热更新」两处必须用同一口 IO——
+// 各写一份字面量时，新增字段必然只接一处（热更新丢了 proxy/mirror，面板看着
+// 保存成功、实际还是旧通道）。
+//
+// proxy_from_env 在 config 里是 *bool：JSON 缺键 = 未表态 → 沿用环境变量（历史
+// 行为，也是绝大多数部署的实际形态）；显式 false 才完全不读环境。
+func updateSettingsFrom(u *Config) updater.Settings {
+	fromEnv := true
+	if u.Update.ProxyFromEnv != nil {
+		fromEnv = *u.Update.ProxyFromEnv
+	}
+	return updater.Settings{
+		AutoEnabled:  u.Update.AutoEnabled,
+		AutoTime:     u.Update.AutoTime,
+		Proxy:        u.Update.Proxy,
+		ProxyFromEnv: fromEnv,
+		Mirror:       u.Update.Mirror,
+	}
+}
+
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, running ...*Config) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read current config: %w", err)
+	}
+	// 重启清单的比较基线：优先用「运行中配置」（含 env 覆盖与启动归一化）；
+	// 未传入（测试/旧调用）时退化为磁盘旧值。见 restartRequiredFields。
+	previous, err := ParseConfig(oldRaw)
+	if err != nil {
+		return nil, fmt.Errorf("parse current config: %w", err)
+	}
+	baseline := previous
+	if len(running) > 0 && running[0] != nil {
+		baseline = running[0]
 	}
 	var cur, incoming map[string]any
 	if err := json.Unmarshal(oldRaw, &cur); err != nil {
@@ -439,101 +925,194 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, err
 	}
+	// 环境变量覆盖与启动同优先级：保存路径同样应用（否则 env 托管字段会被文件值
+	// 抢班——面板显示 env 值、运行却按文件值）。移植上游 PR #104。
+	applyEnv(newCfg)
+	if err := newCfg.normalize(); err != nil {
+		return nil, err
+	}
 
 	// 3) 落盘（原子替换）。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if openErr != nil {
-			_ = os.Remove(tmp)
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
-		}
-		_, writeErr := f.Write(out)
-		if writeErr == nil {
-			writeErr = f.Sync()
-		}
-		closeErr := f.Close()
-		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
-		// 可手工恢复）；写成功才清理。
-		if writeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
-		}
-		_ = os.Remove(tmp)
-		if closeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
+	// safefile：tmp fsync 后才 rename，并把上一份有效配置留成 config.json.bak
+	// —— 掉电把 config.json 留成半截时，下次启动能捡回上一份。
+	if err := safefile.WriteKeep(path, out, 0o600); err != nil {
+		switch {
+		case errors.Is(err, fs.ErrPermission):
+			// 配置所在目录不可写：Docker 里 /app 属主是镜像内的 app(10001)，而 compose 让
+			// 容器以 PUID(如 1000) 运行 —— 挂载进去的 config.json 可写、目录不行，于是原子
+			// 替换连 tmp 都建不出来（issue #134：write config: open /app/config.json.tmp:
+			// permission denied）。文件本身可写就退回原地重写，不再要求目录可写。
+			if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("write config (目录不可写，原地重写也失败): %w", inPlaceErr)
+			}
+		case errors.Is(err, syscall.EBUSY):
+			// A single-file Docker bind mount cannot be renamed over its mount
+			// target (Linux returns EBUSY / "device or resource busy"). Keep the
+			// atomic path for regular files, but update the mounted file in place
+			// for this specific deployment shape.
+			if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("replace config (bind mount fallback): %w", inPlaceErr)
+			}
+		default:
+			return nil, fmt.Errorf("write config: %w", err)
 		}
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	// 白名单同步重建（issue #68）：面板保存 models.allowed 后即时生效。
+	newAllowedModels, newAllowlistEnabled := livecfg.NormalizeAllowedModels(newCfg.Models.Allowed)
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		APIKey:                newCfg.APIKey,
+		SoftCooldown:          newCfg.SoftRateDur,
+		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     newCfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: newCfg.Features.WatermarkStripEnabled,
+		ThreeDEnabled:         newCfg.Features.ThreeDEnabled,
+		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		RecordContext:         newCfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
+		AllowedModels:    newAllowedModels,
+		AllowlistEnabled: newAllowlistEnabled,
+		ModelAliases:     livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
+		// 思考档位策略镜像：与 up.SetEffortPolicy 同批热更新，面板立即回显新生效值。
+		ThinkingEnabled:        newCfg.Thinking.Enabled,
+		ThinkingDefaultEffort:  newCfg.Thinking.DefaultEffort,
+		ThinkingClientPriority: newCfg.Thinking.ClientPriority,
+		ThinkingOverrideScope:  newCfg.Thinking.OverrideScope,
+		ThinkingModelDefaults:  newCfg.Thinking.ModelDefaults,
+		ModelFallback:          newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	if up.ProxyPool != nil {
+		up.ProxyPool.SetExitLookup(newCfg.Features.ProxyExitLookup)
+	}
+	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(newCfg.Prompt.KeepRecentRounds))
+	// 3D 临时凭证热生效：面板保存后整体替换手工凭证表（内容不进日志）。
+	// 自动签发开关（three_d_auto_token）只在启动时装配，面板改了它要重启才生效。
+	if sc, ok := up.ThreeDCredential.(*upstream.StaticThreeDCredentials); ok {
+		sc.Replace(newCfg.Features.ThreeDTempTokens)
+	}
+	if au, ok := up.ThreeDCredential.(*upstream.AutoThreeDCredentials); ok {
+		au.ReplaceManual(newCfg.Features.ThreeDTempTokens)
+	}
+	// 思考档位策略热生效：改默认档 / 切换客户端优先或作用域后，下一次 chat 即按新策略。
+	up.SetEffortPolicy(effortPolicyOf(newCfg))
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
+	p.SetBalanceWindow(newCfg.BalanceWindowDur)             // 窗口用量调度热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
+	p.SetCreditFloorMaxRate(newCfg.Pool.CreditFloorMaxRate) // 保底倍率上限热生效（0 = 严格模式）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
-	sch.Reconfigure(
-		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
-		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		newCfg.Schedule.GrowthHours,
-		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
-		!newCfg.Schedule.GrowthEnabled)
-	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
+	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)              // 保留积分热生效（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
+	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
+	p.SetAccountShare(newCfg.Pool.AccountShare)
+	p.SetStrategy(newCfg.Pool.SelectionStrategy) // 选号策略热生效
+	sch.Reconfigure(scheduler.ScheduleParams{
+		CheckinHours:   newCfg.Schedule.CheckinHours,
+		TravelHours:    newCfg.Schedule.TravelHours,
+		ActivityHours:  newCfg.Schedule.ActivityHours,
+		KeepaliveHours: newCfg.Schedule.KeepaliveHours,
+		GrowthHours:    newCfg.Schedule.GrowthHours,
 
-	return restartRequiredFields(newCfg), nil
+		CheckinDisabled:        !newCfg.Schedule.CheckinEnabled,
+		TravelDisabled:         !newCfg.Schedule.TravelEnabled,
+		ActivityDisabled:       !newCfg.Schedule.ActivityEnabled,
+		WebActivityDisabled:    !newCfg.Schedule.WebActivityEnabled,
+		KeepaliveDisabled:      !newCfg.Schedule.KeepaliveEnabled,
+		GrowthDisabled:         !newCfg.Schedule.GrowthEnabled,
+		IncludeDisabledInTasks: newCfg.Schedule.IncludeDisabledInTasks,
+
+		JitterMinutes:              newCfg.Schedule.JitterMinutes,
+		AccountSpreadMinutes:       newCfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: newCfg.Schedule.AccountSpreadMinGapSeconds,
+	})
+	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
+	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
+	if pn != nil {
+		pn.SetGrowthConcurrency(newCfg.Schedule.GrowthConcurrency) // 排程轮次并发热生效
+	}
+	if gw != nil {
+		gw.SetBudgetLimit(newCfg.Budget.DailyCreditLimit)
+		gw.SetBudgetGuards(newCfg.Budget.BurstCreditLimit, newCfg.Budget.CacheLowRate)
+	}
+
+	return restartRequiredFields(baseline, newCfg), nil
 }
 
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
+// applyCNChatBase 把 config cn.chat_base / cn.billing_base 装配进上游 client；
+// 空则保留内置默认，老配置（无 cn 段）行为不变。
+func applyCNChatBase(up *upstream.Client, cfg *Config) {
+	if cfg.CN.ChatBase != "" {
+		up.ChatBaseCN = cfg.CN.ChatBase
+	}
+	if cfg.CN.BillingBase != "" {
+		up.BillingBaseCN = cfg.CN.BillingBase
+	}
+}
+
+// restartRequiredFields 比较运行中装配值与新配置（有运行配置时以它为准，否则退化
+// 为磁盘旧值），只报告「确实变化且无法热生效」的字段——第二次保存不再重复携带上
+// 一处的待重启项、改回原值即自动清除（无独立的 pending 集合）。移植上游 PR #104；
+// 字段集保留本 fork 自有项（admin/metrics/alerting 整块）。
+func restartRequiredFields(current, next *Config) []string {
 	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
+	changed := func(name string, before, after any) {
+		if !reflect.DeepEqual(before, after) {
+			out = append(out, name)
+		}
 	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
-	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
-	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
-	out = append(out, "upstream.user_agent")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
-	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
-	out = append(out, "server.read_timeout")
+	changed("listen", current.Listen, next.Listen)
+	changed("auth_dir", current.AuthDir, next.AuthDir)
+	changed("state_file", current.StateFile, next.StateFile)
+	changed("upstream.timeout_seconds", current.Upstream.TimeoutSeconds, next.Upstream.TimeoutSeconds)
+	changed("upstream.header_timeout_seconds", current.Upstream.HeaderTimeoutSeconds, next.Upstream.HeaderTimeoutSeconds)
+	changed("upstream.idle_timeout_seconds", current.Upstream.IdleTimeoutSeconds, next.Upstream.IdleTimeoutSeconds)
+	changed("upstream.user_agent", current.Upstream.UserAgent, next.Upstream.UserAgent)
+	changed("upstream.client_version", current.Upstream.ClientVersion, next.Upstream.ClientVersion)
+	changed("upstream.cli_version", current.Upstream.CliVersion, next.Upstream.CliVersion)
+	changed("upstream.client_name", current.Upstream.ClientName, next.Upstream.ClientName)
+	changed("upstream.device_token", current.Upstream.DeviceToken, next.Upstream.DeviceToken)
+	changed("upstream.device_token_file", current.Upstream.DeviceTokenFile, next.Upstream.DeviceTokenFile)
+	changed("upstream.passthrough_ip", current.Upstream.PassthroughIP, next.Upstream.PassthroughIP)
+	changed("features.three_d_auto_token", current.Features.ThreeDAutoToken, next.Features.ThreeDAutoToken)
+	// cn.chat_base / cn.billing_base 同样只在装配期写进上游 client（请求路径并发读取，不做热改）。
+	changed("cn.chat_base", current.CN.ChatBase, next.CN.ChatBase)
+	changed("cn.billing_base", current.CN.BillingBase, next.CN.BillingBase)
+	changed("global.enabled", current.Global.Enabled, next.Global.Enabled)
+	changed("global.chat_base", current.Global.ChatBase, next.Global.ChatBase)
+	changed("global.billing_base", current.Global.BillingBase, next.Global.BillingBase)
+	changed("prompt.mode", current.Prompt.Mode, next.Prompt.Mode)
+	changed("prompt.file", current.Prompt.File, next.Prompt.File)
+	changed("prompt.text", current.PromptText, next.PromptText)
+	changed("upstash.url", current.Upstash.URL, next.Upstash.URL)
+	changed("upstash.token", current.Upstash.Token, next.Upstash.Token)
+	changed("session_sticky.enabled", current.SessionSticky.Enabled, next.SessionSticky.Enabled)
+	changed("session_sticky.ttl", current.SessionTTL, next.SessionTTL)
+	changed("session_sticky.gc_interval", current.SessionGCInterval, next.SessionGCInterval)
+	changed("admin", current.Admin, next.Admin)
+	changed("metrics", current.Metrics, next.Metrics)
+	changed("alerting", current.Alerting, next.Alerting)
+	changed("logging.request_archive_enabled", current.Logging.RequestArchiveEnabled, next.Logging.RequestArchiveEnabled)
+	changed("logging.request_retention_days", current.Logging.RequestRetentionDays, next.Logging.RequestRetentionDays)
+	changed("logging.request_archive_max_mb", current.Logging.RequestArchiveMaxMB, next.Logging.RequestArchiveMaxMB)
+	changed("server.read_timeout", current.Server.ReadTimeout, next.Server.ReadTimeout)
+	changed("server.shutdown_timeout", current.Server.ShutdownTimeout, next.Server.ShutdownTimeout)
 	return out
 }
 

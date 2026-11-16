@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
 
 // uaCaptureTransport 记录出站请求的 User-Agent。
@@ -20,8 +20,11 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
+// chat/refresh 路径 UA=默认 WorkBuddy 三段式；activities 上报（/v2/report）自
+// 2026-10-28 起改走 **chatBase**，UA 也随之变成同样的三段式——5.9.3 真机 /v2/report
+// 实测就是三段式（版本段跟当前分发包，现 `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`），
+// 不是 billing 的 axios。
+// 真正的 billing 端点（checkin / balance / 明细）仍走 axios/1.16.1（billingUA）。
 // 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
@@ -44,11 +47,12 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			wantUA: defaultUAString,
 		},
 		{
-			name: "billing_report",
+			// /v2/report 走 chat 域，UA 用 WorkBuddy 三段式（真机口径）。
+			name: "chat_report",
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.5.4",
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -139,8 +143,8 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				if got := r.Header.Get("User-Agent"); got != v3ProbeUACNForTest {
+					t.Errorf("v3/config UA = %q want %s", got, v3ProbeUACNForTest)
 				}
 				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			default:
@@ -160,11 +164,11 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+	defaultUAString      = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.176.0"
+	billingUAWorkBuddy   = "axios/1.16.1"
+	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -250,10 +254,10 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 }
 
 // TestBillingUA_WhenClientNameSet billing/checkin 路径：client_name 非空时用单段
-// `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
+// `axios/1.16.1`（真机实测：billing 域走 axios 实例，与客户端 UA 无关，也不随 client_version 变）。
 func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → WorkBuddy/5.5.4
+	// 默认 client_version → axios/1.16.1
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
@@ -268,7 +272,7 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	if _, _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
-	// 自定义 client_version → WorkBuddy/6.0.0
+	// 自定义 client_version 不影响 billing UA（仍是 axios/1.16.1）
 	c2 := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUACustomVer {
@@ -320,15 +324,15 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	if _, _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
-	if ua != "WorkBuddy/6.0.0" {
-		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
+	if ua != "axios/1.16.1" {
+		t.Errorf("billing UA = %q want axios/1.16.1 (billing 层走 axios，无品牌段)", ua)
 	}
-	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
-		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
+	if got := c.billingUA(a); got != "axios/1.16.1" {
+		t.Errorf("billingUA() = %q want axios/1.16.1", got)
 	}
 	// 显式 SaaS 还原旧行为（不设 UA）。
 	c.ClientName = "SaaS"
-	if got := c.billingUA(); got != "" {
+	if got := c.billingUA(a); got != "" {
 		t.Errorf("billingUA() SaaS = %q want empty", got)
 	}
 }

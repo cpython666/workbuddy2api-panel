@@ -20,6 +20,14 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	"Tokens prefixed with @",                          // DSH 0.3.x 的 @ 路径说明段（唯一不含品牌词的 DSH 指纹）
+}
+
+// sanitizeIdentityFeatures 身份类特征：品牌词（DSH 身份句）。默认对所有消息角色生效
+// （与上游既有行为一致）；features.sanitize_brand_scope=identity 时只对 system/developer
+// 生效，其余角色按用户数据原样透传。
+var sanitizeIdentityFeatures = []string{
+	"DeepSeek Harness",
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -37,6 +45,115 @@ var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
 
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
 var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+
+// sanitizeDshPathsRe DSH 0.3.x 系统提示里的「@ 开头的路径怎么解析」整段说明。
+//
+// 这一段是本仓唯一漏掉的 DSH 指纹：段内**不含任何品牌词**，所以 sanitizeIdentityRewrites
+// （DeepSeekRuntime → …）的预检根本不会命中，原文原样发出即 400 11-128
+// Illegal API invocation from an unapproved channel。
+//
+// 上游按「连续原文」匹配（逐段二分实测：只发首句放行，前两句连排即拦），所以必须整段
+// 一起改。这里做同义改写而不是删除：@ 路径、相对路径基准、结尾斜杠表示目录、其余按文件读、
+// @"..." 用于含空格的路径——语义全部保留，只换措辞让连续特征失配。
+//
+// 两种线上见过的结尾措辞都要覆盖（(?s) 让 .*? 跨行，段内本来就有换行）：
+//
+//	... quotes a path containing spaces.            （0.3.x 当前写法）
+//	... form only quotes a path that contains spaces. （更早的写法）
+//
+// 段外的 @ 不受影响：邮箱、包名、含 @ 的绝对路径都不匹配。
+//
+// 两条已知边界：预检是大小写敏感的（与 sanitizeFeatures 其它项一致；DSH 原文大小写固定）；
+// 规则属于全局改写层，任何角色里出现这一段都会被改——上游按连续原文匹配、不分角色，
+// 保留原样必然 400。
+var sanitizeDshPathsRe = regexp.MustCompile(
+	`(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?path (?:containing|that contains) spaces\.`)
+
+const sanitizeDshPathsProbe = "Tokens prefixed with @"
+
+// sanitizeDshPathsReplacement 逐句同义改写。与主流实现（workbuddy2api-hub #677/#678）逐字
+// 一致：那段替换串已被真实 CN 账号回放验证过（修复前 400 / 修复后 200）。
+//
+// 一处偏离：原文用 "workspace root"，这里写 "project root"。ithtelab/workbuddy-manager#312
+// 的 0032 声称 2026-10-27 上游又单独加了 "workspace root" 这个词（root→base 即放行），
+// 与上面的整段回放结论冲突——两种说法下 project root 都安全，且与 DSH 语义等价，故取它。
+const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the user explicitly mentioned. " +
+	"Relative paths are resolved against the project root; absolute paths point " +
+	"to files or directories on the host. A trailing slash marks a directory, so " +
+	"list it when its contents matter. Anything else is a file: open it with the " +
+	"read tool when its contents are needed, and never claim to have inspected it " +
+	"before reading. The @\"...\" form only quotes a path that contains spaces."
+
+// sanitizeInjectedIdentityRe 上游服务端注入的身份指令（issue #187）。
+//
+// 形态（2.73MB 请求体 dump 里逐字取证）：
+//
+//	When asked about your model identity, identify yourself as Tencent Hunyuan Hy.
+//
+// 它由上游在服务端拼进模型可见上下文、不出现在任何出站 body 里，因此 dump 看不到；
+// 但模型会在 reasoning_content 里复述原文，客户端把这段思维链带回历史，下一轮就
+// 原样进出站——「声明 → 进历史 → 再看到 → 再声明」的滚雪球就是这么来的。
+//
+// 匹配刻意收紧到「when asked about your … identity, identify yourself as …」整句：
+// 单独匹配 identify yourself as 会误伤正常指令（"Do not identify yourself as an AI."
+// 是合法要求），而整句前缀在真实语料里几乎不可能自然出现。
+//
+// 句尾是「后面不接字母数字的句号」：身份名本身可以带点（GPT-4.1、Claude 3.5），
+// 遇到第一个点就收尾会留下 "1 by OpenAI." 半句。句号后那个字符用捕获组原样接回
+// （RE2 不支持零宽断言），复述形态里常见的引号、换行都不能被吞掉。
+var sanitizeInjectedIdentityRe = regexp.MustCompile(
+	`(?i)when asked about your[^.\n]{0,60}?identity[^.\n]{0,60}?,\s*identify yourself as\s+[^\n]{1,80}?\.(\W|$)`)
+
+// 替换成中性表述：不声明任何身份，也不改变上下文里真实可用的信息。
+const sanitizeInjectedIdentityReplacement = "When asked about your capabilities, answer using only the information available in this conversation.${1}"
+
+// 注入身份指令的两个探针（小写）。门控与正则都按 ASCII 忽略大小写：正则是 (?i)，
+// 门控若按原文大小写比对，"Identify yourself as" 这类复述就会在门口被放过。
+//
+// 作用域只有滚雪球的载体：assistant 的正文与任意消息的 reasoning_content / reasoning
+// （见 scrubInjectedIdentity 的调用处）。system / user 里的同形句是用户自己写的人设
+// （"When asked about your identity, identify yourself as Aria, the Acme assistant."），
+// 改写它等于篡改用户的提示词。
+const (
+	injectedIdentityProbe = "identify yourself as"
+	modelIdentityTagProbe = "model_identity"
+)
+
+// sanitizeModelIdentityTagRe 去掉 <model_identity> 包裹本身（保留内部文本）。
+//
+// 只删标签：真正的危害是标签里那句指令（上面那条规则负责改掉），标签本身留着会让
+// 模型继续把它当「有个身份块」反复提起，每轮都往历史里再写一遍。
+var sanitizeModelIdentityTagRe = regexp.MustCompile(`(?i)</?model_identity>`)
+
+// sanitizeIdentitySentenceRe 客户端「自我介绍句 + 品牌归属」整句（issue #246 的通用版）。
+//
+// 上游把这类句子当成非官方渠道特征：`You are an AI agent powered by <品牌>.`
+// `You are a coding agent powered by <模型>.` `You are <Product> Agent, built by <Vendor>.`
+// 大小写不敏感、按连续原文匹配；单独品牌词或换掉句子结构即放行。此前只有
+// sanitizeIdentityRewrites 把品牌词换掉，句子骨架（`You are … powered by …`）原样留着——
+// 骨架本身就是特征，品牌换了也可能照样 400（workbuddy2api-hub #533/#537/#539、#574
+// 与 ithtelab/workbuddy-manager#312 的 0032 两条独立实现都收敛到这个结论）。
+//
+// 动词表要全：上游补一条新搭配就能让只认单个动词的实现重新 400，故一次列七种。
+// 窗口有界（形容词 0~3 个、名词可省）——`You are free to use tools built by …` 这类
+// 分词修饰宾语的句子不该被误伤，靠的就是这个上界。
+// 只作用于需要应用身份类规则的消息（见 sanitize_messages 的作用域选择）。
+// 结尾用捕获组 (\s|$) 回填，而不是零宽断言：Go 的 RE2 不支持 (?=)，句尾那个空白必须
+// 原样接回去——否则 "…assistant. Use the read tool" 会被粘成 "assistant.Use the read tool"。
+// shortcut: 句子必须以句号收尾才匹配（观测到的指纹都带句号），无句号的变体放行。
+var sanitizeIdentitySentenceRe = regexp.MustCompile(
+	`(?i)You are\s+` +
+		`(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?` +
+		`(?:agent|assistant|model|AI|LLM)?[\s,]*` +
+		`(?:powered by|built on|built by|created by|developed by|made by|trained by)` +
+		`[^\n]*?\.(\s|$)`)
+
+const sanitizeIdentitySentenceReplacement = "You are a helpful AI assistant.${1}"
+
+// sanitizeIdentityVerbs 身份句式的字面量快路（与上面正则的动词表同步维护）。
+var sanitizeIdentityVerbs = []string{
+	"powered by", "built on", "built by", "created by", "developed by", "made by", "trained by",
+}
 
 // sanitizeRewrites 改写层：全模板句逐字替换（每句只改一个词，语义不变）。
 //
@@ -72,26 +189,60 @@ var sanitizeRewrites = [][2]string{
 		// 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
 		// 上游据此识别"在讨论/回显其内部错误码"的请求。
 		// 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
-		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
+		// 不改写必然失败。插入连字符保留可读性与指代（该数字串上零宽空格无效，实测上游会归一化）。
 		"11128",
 		"11-128",
 	},
 }
 
+// sanitizeIdentityRewrites 身份类改写：品牌词 → DeepSeekRuntime。仅在应用身份类规则时使用
+// （见 sanitizeTextWith：sanitize_brand_scope=all 时所有角色都用，identity 时只用身份消息）。
+var sanitizeIdentityRewrites = [][2]string{
+	{
+		// DSH 的身份句（@deepseek-ai/dsh-system-prompt 注入的 harness:identity 段）被上游
+		// 当成「非官方渠道调用」整单拦截：400 11-128 Illegal API invocation from an
+		// unapproved channel。实测换一词即绕过（与插 U+200B 等效，但可见、可 diff）。
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
+	},
+}
+
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
-func sanitizeText(text string) string {
-	if !hasFingerprint(text) {
+// sanitizeText 单段文本净化（全局规则）：预检不中 → 返回原串（零分配）。
+func sanitizeText(text string) string { return sanitizeTextWith(text, false) }
+
+// sanitizeTextIdentity 身份消息（system/developer）专用：在全局规则之外再应用身份类规则
+// （品牌词）。sanitize_brand_scope=all 时非身份消息也走这条（与上游既有行为一致）。
+func sanitizeTextIdentity(text string) string { return sanitizeTextWith(text, true) }
+
+// sanitizeTextWith 按「是否应用身份类规则」净化单段文本。
+//
+// 快路径同时看两类特征：只含品牌词的文本在 brand=false 时原样返回（不 TrimSpace，
+// 用户输入的空白不动），在 brand=true 时进入改写。
+func sanitizeTextWith(text string, brand bool) string {
+	if !hasFingerprint(text) && !(brand && hasIdentityFingerprint(text)) {
 		return text
 	}
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
+	}
+	if brand {
+		// 身份句式先于品牌词：正则要匹配原文里的品牌全名，先换品牌会让规则失配。
+		text = sanitizeIdentitySentenceRe.ReplaceAllString(text, sanitizeIdentitySentenceReplacement)
+		for _, rw := range sanitizeIdentityRewrites {
+			text = strings.ReplaceAll(text, rw[0], rw[1])
+		}
+	}
+	// @ 路径说明段：预检已是字面量，这里再挡一次，避免无关文本白跑一遍跨行正则。
+	if strings.Contains(text, sanitizeDshPathsProbe) {
+		text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsReplacement)
 	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
 	if strings.Contains(text, "cc_") {
 		prev := ""
-		for prev != text { // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）
+		for prev != text { // 清尾随裸 kv（）
 			prev = text
 			text = sanitizeKvRe.ReplaceAllString(text, "")
 		}
@@ -101,26 +252,164 @@ func sanitizeText(text string) string {
 	return strings.TrimSpace(text)
 }
 
+// scrubInjectedIdentity 改掉上游服务端注入、又被模型复述回历史的身份指令（issue #187），
+// 并去掉 <model_identity> 标签本身。只对滚雪球的载体调用（见 sanitizeMessages），不 TrimSpace，
+// 不命中时原样返回。
+func scrubInjectedIdentity(text string) string {
+	if containsFoldASCII(text, injectedIdentityProbe) {
+		text = sanitizeInjectedIdentityRe.ReplaceAllString(text, sanitizeInjectedIdentityReplacement)
+	}
+	if containsFoldASCII(text, modelIdentityTagProbe) {
+		text = sanitizeModelIdentityTagRe.ReplaceAllString(text, "")
+	}
+	return text
+}
+
+// sanitizeBareHdrProbe 裸键名兜底正则的字面量探针，**从正则本身推导**而不是手抄。
+//
+// 手抄一份的风险是刚踩过的：探针与正则体不同步（"…-hdr" vs "…-header"）时预检永远
+// 判假，整条净化被静默跳过，而测试仍然全绿（它测的是正则，不是预检）。这里直接取
+// sanitizeBareHdrRe.String() 去掉 "(?i)" 的部分；一旦正则不再是纯字面量（含元字符），
+// 探针置空，hasFingerprint 回落成「直接跑正则」——慢但绝不会判错。
+var sanitizeBareHdrProbe = func() string {
+	const foldPrefix = "(?i)"
+	s := sanitizeBareHdrRe.String()
+	if !strings.HasPrefix(s, foldPrefix) {
+		return ""
+	}
+	body := s[len(foldPrefix):]
+	if body == "" || strings.ContainsAny(body, `\[](){}*+?|^$.`) {
+		return ""
+	}
+	return body
+}()
+
+// containsFoldASCII 大小写不敏感（仅 ASCII）的子串查找，零分配。
+//
+// 用途：`(?i)` 正则做「有没有这个词」的存在性判断，RE2 会给每个字节跑一遍
+// fold 状态机；线上实测这一项占整个请求体预处理 CPU 的 56%（170K token 的
+// 代理上下文里，每个 message 都要过一遍）。这里换成单遍扫描 + 首字符快跳，
+// 命中即返回。
+//
+// 只做预检：非字母字符的 |0x20 折叠会出现少量误命中（如 '^' 与 '~'），
+// 代价只是多跑一次正则确认，不会漏判、不会改文本。
+func containsFoldASCII(s, sub string) bool {
+	if sub == "" {
+		return true
+	}
+	n := len(sub)
+	if len(s) < n {
+		return false
+	}
+	c0 := sub[0]
+	c0f := c0 | 0x20
+	for i := 0; i+n <= len(s); i++ {
+		c := s[i]
+		if c|0x20 != c0f {
+			continue
+		}
+		ok := true
+		for j := 1; j < n; j++ {
+			a, b := s[i+j], sub[j]
+			if a != b && a|0x20 != b|0x20 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
 // header 键名有大小写变体（X-Anthropic-...）且可能以裸键名形态出现（无冒号），
 // Contains 大小写敏感、sanitizeHdrRe 要求冒号——两者都会漏掉「混合大小写 + 裸键名」，
-// 必须再用不要求冒号的 (?i) 正则兜底（sanitizeBareHdrRe），否则整条净化被跳过。
-// sanitizeBareHdrRe 不要求冒号，是 sanitizeHdrRe 的超集，故无需再单独匹配后者。
+// 必须再兜一层不要求冒号的检测（sanitizeBareHdrRe），否则整条净化被跳过。
+//
+// 兜底检测用 containsFoldASCII 而不是 sanitizeBareHdrRe.MatchString：判据完全等价
+// （该正则只匹配这一个字面量、只关心是否存在），但 RE2 大小写折叠是整条净化链上
+// 最贵的一步（线上 profile：占预处理 CPU 56%）。
 func hasFingerprint(text string) bool {
 	for _, f := range sanitizeFeatures {
 		if strings.Contains(text, f) {
 			return true
 		}
 	}
-	return sanitizeBareHdrRe.MatchString(text)
+	if sanitizeBareHdrProbe == "" {
+		// 正则形状变了（不再是纯 (?i) 字面量）：回落成直接跑正则，正确性优先。
+		return sanitizeBareHdrRe.MatchString(text)
+	}
+	return containsFoldASCII(text, sanitizeBareHdrProbe)
+}
+
+// hasIdentityVerbShape 身份句式的廉价形状探测：「 by 」或「 on 」是否出现过。
+//
+// 这是 sanitizeIdentitySentenceRe 的必要条件——正则里的动词表（powered by / built on /
+// built by / created by / developed by / made by / trained by）每一项都含「 by 」或
+// 「 on 」，所以形状不成立时正则必然不匹配，直接跳过。
+//
+// 为什么值得单独写：原实现是「逐个动词 containsFoldASCII」= 7 次全量扫描；
+// 线上 profile 里这一段占预处理 CPU 的 26%（170K token 上下文里每个 message 都扫 7 遍）。
+// 这里改成一遍扫描同时看两个形状，命中即返回。
+func hasIdentityVerbShape(s string) bool {
+	for i := 0; i+3 <= len(s); i++ {
+		c := s[i] | 0x20
+		var want byte
+		switch c {
+		case 'b':
+			want = 'y' // "by "
+		case 'o':
+			want = 'n' // "on "
+		default:
+			continue
+		}
+		if s[i+1]|0x20 != want || s[i+2] != ' ' {
+			continue
+		}
+		if i > 0 && s[i-1] != ' ' { // 前置必须是空格：「 by 」/「 on 」是动词的一部分
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// hasIdentityFingerprint 身份类特征（品牌词 / 身份句式）预检；只在需要应用身份类规则时调用，
+// 保证 brand=false 的路径不会因为只含品牌词而进入清洗（否则末尾 TrimSpace 会裁掉用户空白）。
+//
+// 命中也只是"形状成立"，仍要正则确认：只按 "by"/"on" 判真会把「讲解某产品」的普通
+// 用户消息也拖进清洗。
+func hasIdentityFingerprint(text string) bool {
+	for _, f := range sanitizeIdentityFeatures {
+		if strings.Contains(text, f) {
+			return true
+		}
+	}
+	// 动词探测用 hasIdentityVerbShape 而不是 strings.ToLower(text)：后者对每条消息
+	// 都整段小写化（170K token 的上下文里是 600KB 的分配 + 拷贝），而这里只需要
+	// 「有没有这个词」——线上 profile 里 ToLower 占预处理 CPU 6.5%。
+	// 命中也只是形状成立，仍需正则确认：只按 "by"/"on" 判真会把「讲解某产品」的
+	// 普通用户消息也拖进清洗。
+	if !hasIdentityVerbShape(text) {
+		return false
+	}
+	return sanitizeIdentitySentenceRe.MatchString(text)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
+// brand 为 false 时不应用身份类规则（见 sanitizeMessages 的作用域选择）。
 // 返回净化后的值及是否发生变化。
-func sanitizeContent(v any) (any, bool) {
+func sanitizeContent(v any, brand bool) (any, bool) {
+	return mapContentText(v, func(s string) string { return sanitizeTextWith(s, brand) })
+}
+
+// mapContentText 对字符串 content 或多模态数组里每个 text part 应用 f。
+func mapContentText(v any, f func(string) string) (any, bool) {
 	switch c := v.(type) {
 	case string:
-		s := sanitizeText(c)
+		s := f(c)
 		return s, s != c
 	case []any:
 		changed := false
@@ -133,7 +422,7 @@ func sanitizeContent(v any) (any, bool) {
 			if !ok {
 				continue
 			}
-			if s := sanitizeText(text); s != text {
+			if s := f(text); s != text {
 				m["text"] = s
 				changed = true
 			}
@@ -149,7 +438,9 @@ func sanitizeContent(v any) (any, bool) {
 // 这块长期是盲区：工具调用消息的 content 通常是 null，而旧版 sanitizeMessages
 // 在 content 缺失时直接 continue，整条消息连 tool_calls 一起被跳过——
 // 于是历史里任何写进工具参数的被拦字符串（文件名、命令、写入内容）都会原样漏出。
-func sanitizeToolCalls(v any) bool {
+// sanitizeToolCalls 净化 assistant.tool_calls[].function.arguments（字符串化 JSON）。
+// brand 决定是否应用身份类规则（品牌词）；其余全局规则始终应用。
+func sanitizeToolCalls(v any, brand bool) bool {
 	callList, ok := v.([]any)
 	if !ok {
 		return false
@@ -168,7 +459,7 @@ func sanitizeToolCalls(v any) bool {
 		if !ok {
 			continue
 		}
-		if s := sanitizeText(args); s != args {
+		if s := sanitizeTextWith(args, brand); s != args {
 			fn["arguments"] = s
 			changed = true
 		}
@@ -176,42 +467,81 @@ func sanitizeToolCalls(v any) bool {
 	return changed
 }
 
-// sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
-func sanitizeMessages(messages []any) bool {
+// sanitizeTools 净化 tools[].function.description。
+//
+// 工具描述由客户端作者撰写（Claude Code / Codex 这类会把身份句写进 description），
+// 只洗 messages 时它整段原样出站（上游 issue #395 同类）。shortcut: 只洗 OpenAI 形状的
+// function.description，Anthropic 形状的顶层 description 与 parameters 里的 schema 描述不洗。
+func sanitizeTools(v any, brandGlobal bool) {
+	tools, ok := v.([]any)
+	if !ok {
+		return
+	}
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tm["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if d, ok := fn["description"].(string); ok {
+			if s := sanitizeTextWith(d, brandGlobal); s != d {
+				fn["description"] = s
+			}
+		}
+	}
+}
+
+// sanitizeMessages 净化 messages 中的 content、reasoning 与 tool_calls；任一命中返回 true。
+//
+// brandGlobal 来自 features.sanitize_brand_scope：true（默认 "all"）时身份类规则对所有
+// 消息角色生效，与上游既有行为一致；false（"identity"）时只对 system/developer 生效，
+// 其余角色的同名文本按用户数据原样透传（实测 user 里的品牌词不触发 11-128）。
+func sanitizeMessages(messages []any, brandGlobal bool) bool {
 	changed := false
 	for _, msg := range messages {
 		m, ok := msg.(map[string]any)
 		if !ok {
 			continue
 		}
+		role, _ := m["role"].(string)
+		identity := strings.EqualFold(strings.TrimSpace(role), "system") ||
+			strings.EqualFold(strings.TrimSpace(role), "developer")
+		brand := brandGlobal || identity
+		clean := func(s string) string { return sanitizeTextWith(s, brand) }
+		// 思维链字段与 assistant 正文是注入身份指令的回流载体（scrubInjectedIdentity）；
+		// system / user 的正文不在此列，那里同形的句子是用户自己写的人设。
+		carrier := func(s string) string { return scrubInjectedIdentity(clean(s)) }
+		contentClean := clean
+		if strings.EqualFold(strings.TrimSpace(role), "assistant") {
+			contentClean = carrier
+		}
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContent(c); ch {
+			if nc, ch := mapContentText(c, contentClean); ch {
 				m["content"] = nc
 				changed = true
 			}
 		}
-		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
-		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
+		// reasoning_content（思维链回填字段）实测同样携带指纹，与 content 同等净化。
 		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeText(rc); s != rc {
+			if s := carrier(rc); s != rc {
 				m["reasoning_content"] = s
 				changed = true
 			}
 		}
-		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
-		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
-		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
-		// 裸 "11128" 这种反探测串同样致命。
+		// reasoning：另一形态的思维链字段（backfillReasoningContent 会镜像一份）。
 		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeText(r); s != r {
+			if s := carrier(r); s != r {
 				m["reasoning"] = s
 				changed = true
 			}
 		}
 		if tc, ok := m["tool_calls"]; ok {
-			if sanitizeToolCalls(tc) {
+			if sanitizeToolCalls(tc, brand) {
 				changed = true
 			}
 		}

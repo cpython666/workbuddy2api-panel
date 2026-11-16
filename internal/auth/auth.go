@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,12 +11,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -43,6 +46,16 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// 来源文件是新版桌面端的 $wbEncrypted 加密形态（见 wbencrypted.go）时才非零：
+	//   - wbSealed：原本是信封的字段路径（"auth.accessToken" / 扁平形 "accessToken"）；
+	//   - wbDoc：解密后的整份文档。SaveAtomic 以它为底回写，桌面端自己的字段（phoneNumber、
+	//     uin 等）与原有形态（嵌套/扁平）都保留，再按 wbSealed 复原信封；
+	//   - expiresAtMillis：来源的 expiresAt 是毫秒（桌面端口径）。内存里统一用秒，回写换回毫秒。
+	// 只在 Parse 里写，之后只读。
+	wbSealed        map[string]bool
+	wbDoc           map[string]any
+	expiresAtMillis bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -209,17 +222,138 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// apiTokenPrefixes 静态 API Key 的前缀集合：ck_（CodeBuddy 控制台签发）与
+// pt_（官方 CLI @tencent-ai/codebuddy-code 另有该前缀）。
+//
+// 官方 CLI 的判据是 tokenType === "ApiKey" 且 token 以这两个前缀之一开头；auth
+// 文件不持久化 tokenType（refresh 只认 OAuth 设备流，静态 Key 无法刷新），前缀是
+// 落盘形态里唯一稳定、跨进程一致的判据。
+var apiTokenPrefixes = []string{"ck_", "pt_"}
+
+// isAPIKeyToken 判 token 是否以静态 API Key 前缀开头。
+func isAPIKeyToken(at string) bool {
+	for _, p := range apiTokenPrefixes {
+		if strings.HasPrefix(at, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAPIKeyLocked IsAPIKey 的无锁内部实现：仅限**已持 a.mu** 的调用方使用
+// （sync.Mutex 不可重入，锁内再调 AccessTokenValue 会自锁）。
+func (a *Auth) isAPIKeyLocked() bool { return isAPIKeyToken(a.AccessToken) }
+
+// IsAPIKey 报告账号是否为静态 API Key 账号（AccessToken 以 ck_/pt_ 开头）。
+//
+// 静态 Key 直接可用（Authorization: Bearer <key>，官方 CLI 同时发 X-API-Key），
+// 但它**没有**个人账号身份：签到 / 成长任务 / 连登 / 旅行 / 夜猫子一律不适用，
+// 额度只能走企业口径端点（个人 get-user-resource 对静态 Key 返回空 Accounts），
+// 见 UsesEnterpriseBilling。
+//
+// 经 AccessTokenValue() 加锁读取：RefreshToken 会在锁内改写 AccessToken。
+func (a *Auth) IsAPIKey() bool {
+	if a == nil {
+		return false
+	}
+	return isAPIKeyToken(a.AccessTokenValue())
+}
+
+// UsesEnterpriseBilling 报告账号的额度查询是否该走企业口径端点
+// （/v2/billing/meter/get-enterprise-user-usage）。
+//
+// 企业版与静态 API Key 账号同属此列：个人 get-user-resource 对二者均返回空
+// Accounts（企业账号无个人资源包；静态 Key 无个人账号身份），额度必须走企业口径，
+// 否则余额恒为 0 → 积分保底把可用号当成耗尽号挡掉。
+func (a *Auth) UsesEnterpriseBilling() bool { return a.IsEnterprise() || a.IsAPIKey() }
+
+// TokenSource 从 AccessToken 的 JWT payload 里读 token_source 声明（官方客户端用它
+// 填出站 X-Auth-Method 与 X-Userinfo.token_source）。非 JWT / 无该声明 / 解码失败一律
+// 返回空串——空表示「这个账号没有该维度」，调用方随之不发对应头（不伪造）。
+//
+// 每次现解码而不缓存：RefreshToken 会整体换发 token，token_source 可能随重新授权翻转。
+// 成本是一次 base64 + 小 JSON，相对一次上游请求可忽略。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "token_source")
+}
+
+// IdSource 从 AccessToken 的 JWT payload 里读 `id_source` 声明（官方客户端据此填
+// 出站 X-Id-Source 头与 X-Userinfo.id_source 段）。
+//
+// 与 TokenSource 的差别很重要：token_source 描述「这次授权走了哪条流程」（企业切换等，
+// 个人号也有），id_source 描述「身份来源」——两者在真机 runIdentityHeaders() 里是
+// 各自独立触发的条件维度。同样现解码不缓存：换发 token 后声明可能变。
+func (a *Auth) IdSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "id_source")
+}
+
+// jwtClaim 解出 JWT payload 里的指定字符串声明；非 JWT / 解码失败返回空。
+// 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtClaim(token, name string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	v, _ := payload[name].(string)
+	return strings.TrimSpace(v)
+}
+
+// SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
+// 猫猫旅行 / 夜猫子）。企业版与静态 API Key 都没有该体系：
+//   - 企业版：上游一律拒绝（400 code 10001 / 403 growth-only，见 IsEnterprise）；
+//   - 静态 API Key：根本没有个人账号身份。
+//
+// scheduler 各任务与 panel 成长入口统一用本方法门控，避免对注定失败的端点空发请求、
+// 把本可正常对话的号攒出一串上游报错。
+func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
+// SupportsPersonalEndpoints 报告账号是否可调用「签到 / 任务列表」这类显式报错的个人端点。
+// 与 SupportsPersonalGrowth（执行类门控）刻意分开命名：两者当前的判据相同，但语义不同
+// ——将来若某类账号「读得到、记不上账」，只需改这一处而不影响执行类门控。
+func (a *Auth) SupportsPersonalEndpoints() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
+// 不要再用 AccessToken 的 token_source=enterprise_switch 判定「企业上下文」：
+// 实测两个只带该章的**个人版**号（enterpriseId 空）成长任务全部 claimed、行为事件
+// 照常计分——该章只记本次授权走了哪条流程。企业形态一律以 enterpriseId 为准。
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
 	d = strings.ToLower(strings.TrimSpace(d))
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+		return true
+	}
+	// 官方 CLI 国际站域（product.json externalDomain: www.codebuddy.ai）。与 workbuddy.ai
+	// 同后端不同主机名，但 domain 落盘值不同，不认它会把国际站账号误判成 cn
+	// （显式 realm 键可兜住面板登录的账号，手写 auth 文件则直接错域路由）。
+	return d == "codebuddy.ai" || strings.HasSuffix(d, ".codebuddy.ai")
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 静态 API Key 永不刷新（refresh 端点只认 OAuth 设备流）：恒 false，否则请求
+	// 路径会先 refresh、失败后把该号当坏号冷却换号——Key 本身是好的。
+	if a.isAPIKeyLocked() {
+		return false
+	}
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -234,6 +368,13 @@ func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
+	// 新版桌面端把 auth 字段换成 $wbEncrypted 信封（见 wbencrypted.go）。
+	// 解密后再按原两形态解析；未加密文件原样返回，不吃这条路径。
+	dec, sealed, wbDoc, err := decryptWBEncrypted(raw)
+	if err != nil {
+		return nil, err
+	}
+	raw = dec
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -300,7 +441,33 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	rawExpires := a.ExpiresAt
+	a.ExpiresAt = normalizeExpiresAt(a.ExpiresAt)
+	if len(sealed) > 0 {
+		a.wbSealed, a.wbDoc, a.expiresAtMillis = sealed, wbDoc, a.ExpiresAt != rawExpires
+	}
 	return &a, nil
+}
+
+// expiresAtMillisThreshold 区分「秒」与「毫秒」时间戳的分界（1e11）。
+//
+// 单位到 1e11 秒已是公元 5138 年，真实凭证不可能；而 1e11 毫秒 = 1973 年，
+// 毫秒制当前值（~1.8e12）远在其上。阈值取在两者之间不会误判任一侧。
+const expiresAtMillisThreshold = 100_000_000_000
+
+// normalizeExpiresAt 把上游凭据的 expiresAt 归一到 Unix 秒。
+//
+// 为什么需要：官方 CodeBuddy CLI 的凭据文件
+// （%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info）写的是**毫秒**
+// （实测 1795254516410），而本仓与旧插件 OAuth 落盘的是**秒**。直接按秒解释毫秒
+// 会把到期时间推到公元 58800 年 → NeedsRefresh 恒 false → token 永不刷新 →
+// 到期后账号静默失效（表现为「用了一个月突然全部 401」）。导入官方凭据是本仓
+// 支持的用法，所以解析入口必须归一，而不是靠使用者手改文件。
+func normalizeExpiresAt(v int64) int64 {
+	if v > expiresAtMillisThreshold {
+		return v / 1000
+	}
+	return v
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
@@ -315,34 +482,45 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
-	doc := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"realm":        a.realm,
-		},
-		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
-		},
-	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if a.DeviceToken != "" {
-		doc["device_token"] = a.DeviceToken
+	var doc map[string]any
+	if len(a.wbSealed) > 0 {
+		// 来源是桌面端的加密文件：以解密后的原文档为底回写，再按读入时的信封清单复原
+		// （见 sealForSave）。封装失败就拒绝落盘——明文覆盖加密文件比写不进去更糟。
+		doc = a.wbOverlayLocked()
+		if err := sealForSave(doc, a.wbSealed); err != nil {
+			return err
+		}
+	} else {
+		doc = map[string]any{
+			"auth": map[string]any{
+				"accessToken":  a.AccessToken,
+				"refreshToken": a.RefreshToken,
+				"expiresAt":    a.ExpiresAt,
+				"domain":       a.Domain,
+				"realm":        a.realm,
+			},
+			"account": map[string]any{
+				"uid":          a.UID,
+				"enterpriseId": a.EnterpriseID,
+				"nickname":     a.Nickname,
+			},
+		}
+		// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
+		// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+		if a.DeviceToken != "" {
+			doc["device_token"] = a.DeviceToken
+		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 落盘走 safefile：tmp fsync 后才 rename（掉电不会留下长度正确、内容全 0 的
+	// 凭证文件），并把上一份有效内容留成 <file>.bak —— LoadDir 读到坏文件时用它。
+	if err := safefile.WriteKeep(a.FilePath, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := fmt.Sprintf("写入 %s 失败: %v", a.FilePath, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -351,7 +529,125 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	return nil
+}
+
+// wbOverlayLocked 加密来源文件的回写底稿：解密后原文档的副本，把本包管理的字段写回它们
+// 原来的位置（嵌套形在 auth / account 下，扁平形在顶层）。原文没有、值又为空的字段不新增，
+// 其余桌面端字段原样保留；expiresAt 按来源的单位写回。调用方持 a.mu。
+func (a *Auth) wbOverlayLocked() map[string]any {
+	doc := cloneJSON(a.wbDoc).(map[string]any)
+	authObj, nested := doc["auth"].(map[string]any)
+	accObj := doc
+	if nested {
+		if accObj, _ = doc["account"].(map[string]any); accObj == nil {
+			accObj = map[string]any{}
+			doc["account"] = accObj
+		}
+	} else {
+		authObj = doc
+	}
+	set := func(m map[string]any, k string, v any, empty bool) {
+		if _, has := m[k]; has || !empty {
+			m[k] = v
+		}
+	}
+	exp := a.ExpiresAt
+	if a.expiresAtMillis {
+		exp *= 1000
+	}
+	set(authObj, "accessToken", a.AccessToken, false)
+	set(authObj, "refreshToken", a.RefreshToken, a.RefreshToken == "")
+	set(authObj, "expiresAt", exp, a.ExpiresAt == 0)
+	set(authObj, "domain", a.Domain, a.Domain == "")
+	set(authObj, "realm", a.realm, a.realm == "")
+	set(accObj, "uid", a.UID, a.UID == "")
+	set(accObj, "enterpriseId", a.EnterpriseID, a.EnterpriseID == "")
+	set(accObj, "nickname", a.Nickname, a.Nickname == "")
+	set(doc, "device_token", a.DeviceToken, a.DeviceToken == "")
+	return doc
+}
+
+// cloneJSON 深拷贝 JSON 解码出的值（map / slice 递归，其余是不可变的标量）。
+func cloneJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = cloneJSON(x)
+		}
+		return m
+	case []any:
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = cloneJSON(x)
+		}
+		return s
+	}
+	return v
+}
+
+// SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
+//
+// 为什么需要：refresh 成功后上游已经轮换了 RT，新 token 只在内存里；如果这一次
+// 落盘失败（磁盘瞬时满、bind-mount 抖动），进程重启会拿旧 RT 去刷新——旧 RT 可能
+// 已被消费，账号直接进入「需要重新登录」。重试把瞬时失败挡掉；仍失败由调用方
+// 打 ERR（错误汇总可见），至少不让问题静默。
+func (a *Auth) SaveAtomicRetry() error {
+	var err error
+	for i, delay := range []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond} {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+		if err = a.SaveAtomic(); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// AdoptNewer 用 src（同一账号从磁盘新读出的凭证）原地更新 a，仅当 src 的令牌更新时才动。
+// 返回是否更新。
+//
+// 为什么原地改而不是换指针：池里的 *Auth 被在途请求与令牌刷新共享，刷新在 a.mu 内原地
+// 写新令牌。换成一个从文件读出的新对象有两种坏结果：扫描早于刷新写回时，新对象带的是
+// 已被轮换作废的 refresh token；刷新还在旧对象上进行时，结果写进了没人用的对象。
+// 所以只在锁内、只在磁盘上的令牌更新（过期时刻更晚，典型为外部重新登录）时拷字段。
+// 过期时刻都为 0 的静态 API Key 以令牌不同为准。
+func (a *Auth) AdoptNewer(src *Auth) bool {
+	if a == src {
+		return false
+	}
+	src.mu.Lock()
+	in := Auth{
+		AccessToken: src.AccessToken, RefreshToken: src.RefreshToken, ExpiresAt: src.ExpiresAt,
+		Domain: src.Domain, realm: src.realm, EnterpriseID: src.EnterpriseID,
+		Nickname: src.Nickname, DeviceToken: src.DeviceToken, wbSealed: src.wbSealed,
+	}
+	src.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if in.AccessToken == "" || in.AccessToken == a.AccessToken {
+		return false
+	}
+	if in.ExpiresAt <= a.ExpiresAt && !(in.ExpiresAt == 0 && a.ExpiresAt == 0) {
+		return false
+	}
+	a.AccessToken, a.RefreshToken, a.ExpiresAt = in.AccessToken, in.RefreshToken, in.ExpiresAt
+	a.Domain, a.realm, a.EnterpriseID = in.Domain, in.realm, in.EnterpriseID
+	a.Nickname, a.DeviceToken, a.wbSealed = in.Nickname, in.DeviceToken, in.wbSealed
+	return true
+}
+
+// LoadReport 一次账号目录扫描的结果。
+//
+// Errors 非空表示「本次有文件读不动/解析不了」：账号可能**还在**，只是这一轮看不见。
+// 热重载必须据此放弃删除（见 panel/reload.go）——半写文件被当成「文件已删」会把
+// 在池账号踢掉，而且剔除结果会持久化，下次启动也不复活。
+type LoadReport struct {
+	Auths      []*Auth
+	Files      int
+	ParseError []string // "文件名: 原因"，已按文件粒度去重
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
@@ -359,39 +655,93 @@ func (a *Auth) SaveAtomic() error {
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
+	r, err := LoadDirReport(dir)
 	if err != nil {
 		return nil, err
 	}
-	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
-	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
-	seenUID := make(map[string]string, len(files))
+	return r.Auths, nil
+}
+
+// LoadDirReport 同 LoadDir，另外回报文件数与解析失败的条目（热重载用来判断能否删号）。
+//
+// 目录不存在视为空目录；其余读目录错误（挂载掉了、权限丢了）原样返回。filepath.Glob 会把
+// 这类 I/O 错误吞成「0 个文件」，热重载随后就把整个池删光，所以这里改用 os.ReadDir。
+func LoadDirReport(dir string) (LoadReport, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return LoadReport{}, err
+	}
+	var files []string
+	for _, e := range entries {
+		if ok, _ := filepath.Match("workbuddy*.json", e.Name()); ok && !e.IsDir() {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	report := LoadReport{Files: len(files)}
+	// 按 mtime 升序：同一个号的轮转备份并存时（客户端会写 <name>.<ts>.<pid>.<uuid>.info），
+	// 池里「后载入者胜出」才等于「最新凭证胜出」。不排序的话 glob 顺序（字典序）可能让
+	// 陈旧备份胜出——那账号在面板上表现为 token 失效。取不到 mtime 的文件排最前（先被覆盖）。
+	sort.SliceStable(files, func(i, j int) bool {
+		fi, erri := os.Stat(files[i])
+		fj, errj := os.Stat(files[j])
+		if erri != nil || errj != nil {
+			return erri != nil && errj == nil
+		}
+		return fi.ModTime().Before(fj.ModTime())
+	})
+	// seenUID 重复 UID 检测：同一个号的**个人版与企业版 uid 完全相同**（企业版只是
+	// type→ultimate + 多一个 enterpriseId，实测如此），两份凭证在池里只有一个槽位，
+	// 后载入者胜出。这里打 WARN 并点出两个文件与各自 enterpriseId——否则用户只看到
+	// 「我导了两个号，面板只有一个」。
+	type dupUID struct{ file, eid string }
+	seenUID := make(map[string]dupUID, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		// 坏文件不再静默跳过：safefile.Read 在正文损坏时回退到 .bak（掉电留下的
+		// 全 0 文件因此还能救回账号），两边都坏才放弃，并且说清是哪个文件、坏在哪
+		// ——「账号凭空少了一个」比多打一行 ERROR 难查得多。
+		raw, err := safefile.Read(f, func(b []byte) bool {
+			_, perr := Parse(b)
+			return perr == nil
+		})
 		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 无法读取: %v —— 该账号本次不在池里，修好文件或重新登录", f, err)
+			report.ParseError = append(report.ParseError, filepath.Base(f)+": "+err.Error())
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 解析失败: %v —— 该账号本次不在池里", f, err)
+			report.ParseError = append(report.ParseError, filepath.Base(f)+": "+err.Error())
 			continue
 		}
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
-			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
-				logfmt.Label(a.UID, a.Nickname), prev, f)
+			log.Printf("WARN: uid %s 在 %s（enterpriseId=%q）与 %s（enterpriseId=%q）重复 —— "+
+				"同一账号的个人版/企业版 uid 相同，池里只保留后载入的一份；不用的那份删掉",
+				logfmt.Label(a.UID, a.Nickname), prev.file, prev.eid, f, a.EnterpriseID)
 		}
-		seenUID[a.UID] = f
-		if a.RealmStored() == "" {
-			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
-				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
-				}
-			}
-		}
+		seenUID[a.UID] = dupUID{file: f, eid: a.EnterpriseID}
 		out = append(out, a)
 	}
-	return out, nil
+	// 只给每个 uid 胜出的那份（mtime 最新、最后载入）做 realm 迁移落盘：给落败的旧文件写盘会
+	// 刷新它的 mtime，下次启动它就成了「最新」，胜负来回翻。
+	winner := make(map[string]*Auth, len(out))
+	for _, a := range out {
+		winner[a.UID] = a
+	}
+	for _, a := range out {
+		if winner[a.UID] != a || a.RealmStored() != "" {
+			continue
+		}
+		if changed, r := a.BackfillRealm(); changed {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
+			} else if r == "global" {
+				log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
+			}
+		}
+	}
+	report.Auths = out
+	return report, nil
 }

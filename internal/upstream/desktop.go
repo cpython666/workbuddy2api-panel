@@ -29,22 +29,85 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	// desktopVersion / desktopCommit / desktopReleaseDate 官方分发包实测值
+	// （install-manifest.json 的 appVersion + /v2/report body 的 commit/releaseDate）。
+	// 与面板自身 client_version 分开：/v2/report 是「桌面端行为」指纹，应恒为桌面端版本。
+	//
+	// **按 realm 分开**（2026-10-30 双版本抓包实测）：两版上报的版本三元组不同，
+	// 且 commit/releaseDate 是打包期常量、无法从版本号推导：
+	//
+	//	CN 5.11.3    ideVersion 5.11.3 commit ecace0f7… releaseDate 1794502169764
+	//	global 5.9.4 ideVersion 5.9.4 commit fa0a0901… releaseDate 1793288804029
+	//
+	// CN 三元组 2026-11-16 按 5.11.3 分发包重采（来源同旧值口径：cli/product.json 的
+	// genieVersion / commit / date，与安装包文件名里的短 hash `ecace0f7` 交叉一致）：
+	//   genieVersion = 5.11.3
+	//   commit       = ecace0f7028166695994300182295329b8b95449
+	//   date         = 2026-11-12T16:49:29.764Z → 1794502169764
+	//
+	// 旧值（5.9.3：d4692421… / 1793093056315）来自真机 /v2/report 的 7 条事件，
+	// 与当时的 product.json 交叉一致；新值只有静态证据（未抓 5.11.3 的包上报），
+	// releaseDate 取 product.json 的 date 而非报告事件值，两者历史上相差 ~5s。
+	//
+	// 此前不分档、恒用 global 的三元组，等于给每个国内号都盖了国际版的包指纹
+	// （版本号与安装清单自相矛盾），是最容易被设备侧写识破的一处。
+	desktopVersionCN         = "5.11.3"
+	desktopCommitCN          = "ecace0f7028166695994300182295329b8b95449"
+	desktopReleaseDateCN     = int64(1794502169764)
+	// global 三元组按 5.9.4 国际分发包重采（2026-10-30 拆包）：
+	//   cli/product.json commit = fa0a0901906addaa1a4259f6df347388a5563ded
+	//   cli/product.json date   = 2026-10-29T15:46:44.029Z → 1793288804029
+	//   真机 /v2/update?platform=workbuddy-win32-x64-user&version=5.9.4 与 UA 段一致。
+	desktopVersionGlobal     = "5.9.4"
+	desktopCommitGlobal      = "fa0a0901906addaa1a4259f6df347388a5563ded"
+	desktopReleaseDateGlobal = int64(1793288804029)
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
+
+// desktopUAFor 桌面端 UA：两段品牌一致（与业务链路同源，都是 SDK 的 buildUserAgent）。
+// CN 5.11.3 → `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`；
+// global 5.9.4 → `workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`（真机实测）。
+func desktopUAFor(a *auth.Auth) string {
+	ver, _, _ := desktopTriple(a)
+	brand := uaBrandFor(a)
+	cli := defaultCliVersionFor(a)
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + cli
+}
+
+// desktopTriple 返回该账号域的桌面端 (ideVersion, commit, releaseDate) 三元组。
+// 两版分发包不同 → 三元组不同；nil（默认 CN 形态）走 CN 值。
+func desktopTriple(a *auth.Auth) (ver, commit string, release int64) {
+	if a != nil && a.IsGlobal() {
+		return desktopVersionGlobal, desktopCommitGlobal, desktopReleaseDateGlobal
+	}
+	return desktopVersionCN, desktopCommitCN, desktopReleaseDateCN
+}
+
+// desktopHost 返回 X-Domain 用的裸主机名（与真机一致：www.workbuddy.ai /
+// copilot.tencent.com）。从 base 里剥 scheme 与路径；解析失败时退回 base 原串，
+// 保证不会因为 URL 畸形而把该头发成空串（头缺失同样会触发渠道校验）。
+func (c *Client) desktopHost(a *auth.Auth) string {
+	base := c.desktopBase(a)
+	if u, err := url.Parse(base); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
+}
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
@@ -57,32 +120,45 @@ func deriveID(a *auth.Auth, salt string) string {
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
+// 版本三元组按 realm 取（见 desktopTriple）；qimei36 仅国内版有（见下）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
-	return map[string]any{
+	ver, commit, release := desktopTriple(a)
+	fp := map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
 		"userId":       a.UID,
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"releaseDate":  release,
+		"commit":       commit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   ver,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
-		"timestamp":    now,
-		"presentAt":    now,
+		// osVersion / cpuModel / cpuCores / memorySize 是真机上报名（5.8.4 实测）：
+		// 这些字段上游侧用于设备侧写，缺 cpuModel 是最明显的「非桌面端」特征。
+		"osVersion":  "10.0.28000",
+		"cpuModel":   "11th Gen Intel(R) Core(TM) i5-11320H @ 3.20GHz",
+		"cpuCores":   8,
+		"memorySize": 16,
+		"timestamp":  now,
+		"presentAt":  now,
 	}
+	// qimei36：腾讯设备标识（36 位小写十六进制）。2026-10-20 双版本抓包实测——
+	// 国内版每个 report 事件都带，国际版**一条都不带**（CN 28 键 vs GL 27 键，
+	// 差集恰好只有 qimei36）。故按 realm 条件注入：给国际版补这个键反而是伪造。
+	// 取值按 uid 稳定派生（同 deriveID 口径），保证同号跨重启恒同值。
+	if a != nil && !a.IsGlobal() {
+		fp["qimei36"] = deriveID(a, "qimei")
+	}
+	return fp
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
@@ -115,14 +191,32 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.desktopBase(a))
+	// X-Requested-With：**不发**。
+	//
+	// 2026-10-30 双版本真机复核（国际 5.9.4 37 条 + 国内 5.9.3 多条 /v2/report，
+	// 按 UA 分成两族）：
+	//
+	//	workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/…   ← 本函数发的就是这一族，**无** X-Requested-With
+	//	WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/…      ← 渲染器侧另一条上报，带 X-Requested-With
+	//
+	// 旧实现在 UA 取「RPC 族」的同时又补了 X-Requested-With，等于把两族的头各取一半
+	// 拼成第三族——两族都不像，比少一个头更显眼。
+	req.Header.Set("User-Agent", desktopUAFor(a))
+	// Accept-Encoding：真机 /v2/report 与 chat / billing 同族，四段全声明
+	// （夹具 official_report_cn_head.txt，cn 抓包 report 族 1/1 命中该值）。
+	// 显式声明会关闭 net/http 透明解压，响应由 doJSON→decodeResponseBody 解。
+	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
+	// X-Domain 是**主机名**不是 URL：真机实测 `X-Domain: www.workbuddy.ai`，
+	// 而 desktopBase 返回的是带 scheme 的 base，直接塞进去会发成
+	// `https://www.workbuddy.ai`——与本仓其它头（chat/billing 用 DomainValue 的裸域）
+	// 也不自洽，是最容易被上游按「非客户端形态」识别出来的一处。
+	req.Header.Set("X-Domain", c.desktopHost(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -216,12 +310,12 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -243,7 +337,7 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 	return []DesktopEvent{
 		mk("buddyapp_discover_click", nil),
 		mk("buddyapp_show", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2}),
-		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": "1"}),
+		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": true}),
 		mk("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 		mk("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 	}
@@ -260,11 +354,27 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 	}
 }
 
-// ReportWebEvent 以 Web 端指纹向 www.workbuddy.cn/v2/report 上报单事件。
-// 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
-// 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
+// ReportWebEvent 以 **官方桌面端等价形态** 向 /v2/report 上报单事件。
+//
+// 2026-11-01 真机抓包修正（夹具 testdata/official_report_cn_head.txt）：
+// 官方 /v2/report 在 CN 侧 **只有一种形态**——Node/SDK 发的，11 个头：
+//
+//	Accept: application/json, text/plain, */*
+//	Content-Type: application/json;charset=UTF-8
+//	X-Request-ID / X-Product: SaaS
+//	User-Agent: WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0
+//	Authorization / X-User-Id / X-Domain: www.workbuddy.cn
+//
+// **没有** sec-ch-ua / Sec-Fetch-* / Origin / Referer / x-client-platform。
+// 旧实现造的是一条「浏览器 UA + Origin + Referer」的第三族请求，官方客户端
+// 从不发这种包——而且 UA 里的 `Chrome/152.0.0.0` 是不可能的值（Electron 37
+// 内置 Chromium 138，真机实测 `WorkBuddy/5.9.3 Chrome/138.0.7204.251
+// Electron/37.10.3`）。头与体各自自洽、彼此矛盾，是最容易被单条规则命中的形态。
+//
+// body 仍保留 web 事件形状（os/machineId/userAgent 等）：那条路径的业务载荷
+// 没有真机样本可比对，改头不动体是本轮能拿证据支撑的最小改动。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+	ua := c.userAgent(a)
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
@@ -276,21 +386,33 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
+	base := c.webBase(a)
+	req, err := http.NewRequest(http.MethodPost, base+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", c.webBase(a))
-	req.Header.Set("Referer", pageURL)
+	// 以下逐项照抄真机夹具，顺序与取值都不自己发挥。
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", ua)
+	// X-Request-ID 用**纯随机 32 hex**（NewTraceID），不是 UUIDv7：
+	// 真机 report 样本 `4891f0b179cc4959be94b2c867c16e3c` 解不出时间位，
+	// 而同一客户端的 chat 请求才带毫秒前缀。两条链的 ID 规则不同。
+	req.Header.Set("X-Request-ID", session.NewTraceID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	// Accept-Encoding：同 /v2/report 真机族（四段全声明）。
+	req.Header.Set("Accept-Encoding", "gzip, compress, deflate, br")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	// X-Domain 是**裸主机名**（真机 `X-Domain: www.workbuddy.cn`），不是 URL。
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
+	if u, perr := url.Parse(base); perr == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	req.Header.Set("X-Domain", host)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -348,24 +470,6 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 	return events
 }
 
-// DesktopDesignCanvasSequence 构造「设计创意画布」事件组（实测 create_canvas 计数）：
-// wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
-// 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
-func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
-	return append(events,
-		DesktopEvent{
-			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
-			"requestId": requestID, "source": "summon_keyword", "cost": 12000, "isSuccessful": true,
-		},
-		DesktopEvent{
-			"eventCode": "wbx_design_canvas_open", "conversationId": conversationID,
-			"requestId": requestID, "id": "ardot-file-" + requestID[len(requestID)-8:],
-			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
-		},
-	)
-}
-
 // MarketExpert 专家市场的单个专家（/portal/operation-platform/market/expert/list 响应子集）。
 type MarketExpert struct {
 	ExpertID      string `json:"expert_id"`
@@ -383,6 +487,24 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if expertType != "" {
 		body["expert_type"] = expertType
 	}
+	return c.marketExpertList(a, body)
+}
+
+// MarketExpertSearch 按关键词检索专家市场（等价于客户端「专家页搜索框」）。
+//
+// 请求体里的关键词字段名是 keyword（实测：keyword 生效时 total_count 收窄到 220，
+// search_keyword / query / search 均被忽略返回全量 25318）。同一关键词可能命中多个
+// 同名专家（display_name_zh 与 profession_zh 都会参与匹配），调用方必须按 expert_id
+// 二次筛选，不能取首条。
+func (c *Client) MarketExpertSearch(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	if strings.TrimSpace(keyword) == "" {
+		return nil, fmt.Errorf("market expert search: keyword required")
+	}
+	return c.marketExpertList(a, map[string]any{"page": 1, "page_size": 20, "keyword": keyword})
+}
+
+// marketExpertList 专家市场列表/搜索的公共请求（POST .../market/expert/list）。
+func (c *Client) marketExpertList(a *auth.Auth, body map[string]any) ([]MarketExpert, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -393,7 +515,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
@@ -402,7 +524,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +539,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	// 会话 ID 用官方形态（v4 UUID）。旧实现是 `wb2api-conv-<UnixNano>`——项目缩写 +
+	// 纳秒时间戳直接当 X-Conversation-ID 打给上游，是 issue #51 里最直白的一处自证。
+	conversationID = session.NewConversationID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -437,24 +561,18 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	h := req.Header
-	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
-	h.Set("X-Domain", c.chatBase(a))
-	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
-	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
-	h.Set("x-codebuddy-request", "1")
+	// 头族一律走 ChatHeaders：这条路径原先手搓了 20 多行头，结果与主 chat 路径长期漂移
+	// （缺 X-Trace-ID / X-B3-* / x-stainless-* / acp-connection-id，X-IDE-Version 写死
+	// 5.5.6，X-Request-ID 还是十进制纳秒）。手搓头本身就是漂移的根因——统一出口后
+	// 主路径改一次这里自动跟随。
+	meta := ChatMeta{
+		ConversationID:        conversationID,
+		CacheKeyID:            conversationID,
+		ConversationRequestID: session.NewMessageID(),
+	}
+	c.ChatHeaders(req, a, "", meta)
 	if expertID != "" {
-		h.Set("X-Expert-Id", expertID)
+		req.Header.Set("X-Expert-Id", expertID)
 	}
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
 		fmt.Printf("[dbg] URL=%s\n", req.URL)
@@ -462,7 +580,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
 		}
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return "", "", err
 	}

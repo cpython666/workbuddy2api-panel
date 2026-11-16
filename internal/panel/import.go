@@ -1,97 +1,181 @@
 package panel
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
-	ID            string `json:"id"`
-	Email         string `json:"email"`
-	UID           string `json:"uid"`
-	Nickname      string `json:"nickname"`
-	AccessToken   string `json:"access_token"`
-	RefreshToken  string `json:"refresh_token"`
-	TokenType     string `json:"token_type"`
-	ExpiresAt     int64  `json:"expires_at"`
-	Domain        string `json:"domain"`
-	DosageNotify  string `json:"dosage_notify_code"`
-	PaymentType   string `json:"payment_type"`
-	Status        string `json:"status"`
-	UsageUpdatedAt int64 `json:"usage_updated_at"`
-	LastCheckin   int64  `json:"last_checkin_time"`
-	CheckinStreak int    `json:"checkin_streak"`
-	CreatedAt     int64  `json:"created_at"`
-	LastUsed      int64  `json:"last_used"`
+	ID             string `json:"id"`
+	Email          string `json:"email"`
+	UID            string `json:"uid"`
+	Nickname       string `json:"nickname"`
+	AccessToken    string `json:"access_token"`
+	RefreshToken   string `json:"refresh_token"`
+	TokenType      string `json:"token_type"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Domain         string `json:"domain"`
+	DosageNotify   string `json:"dosage_notify_code"`
+	PaymentType    string `json:"payment_type"`
+	Status         string `json:"status"`
+	UsageUpdatedAt int64  `json:"usage_updated_at"`
+	LastCheckin    int64  `json:"last_checkin_time"`
+	CheckinStreak  int    `json:"checkin_streak"`
+	CreatedAt      int64  `json:"created_at"`
+	LastUsed       int64  `json:"last_used"`
+
+	// EnterpriseID 兼容导出工具的两种写法：cockpit 字段多为 snake_case，
+	// auth 文件与登录接口用 camelCase。任一带值即视为企业版，供签到 /
+	// 成长任务门控与额度口径使用（见 auth.IsEnterprise）。
+	EnterpriseID      string `json:"enterprise_id"`
+	EnterpriseIDCamel string `json:"enterpriseId"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
 //
 //	POST /panel/api/import/cockpit
 //	Content-Type: multipart/form-data
-//	Body: file=<json>
+//	Body: file=<json>（可重复，按表单顺序逐个解码）
+//	      dryRun=true|1 → 只做校验与预览，不落盘、不上游校验、不签到
 //
-// 返回 {ok, total, imported, skipped, errors}。
+// 多个文件是「整体事务」：任一文件不是合法 JSON 或没有任何账号就整体 400，不做
+// 「先把前面导进去」（导入不可逆，半成功最难收拾）。
+//
+// 返回 {ok, total, imported, skipped, errors, creates, overwrites, dry_run}。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
 	}
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "missing file field: "+err.Error())
-		return
-	}
-	defer file.Close()
+	dryRun := strings.EqualFold(strings.TrimSpace(r.FormValue("dryRun")), "true") ||
+		strings.TrimSpace(r.FormValue("dryRun")) == "1"
 
-	raw, err := io.ReadAll(file)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read file: "+err.Error())
+	headers := r.MultipartForm.File["file"]
+	if len(headers) == 0 {
+		writeErr(w, http.StatusBadRequest, "missing file field")
 		return
 	}
 
 	var accounts []cockpitAccount
-	if err := json.Unmarshal(raw, &accounts); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if len(accounts) == 0 {
-		writeErr(w, http.StatusBadRequest, "empty accounts array")
-		return
+	var sources []string // 与 accounts 平行：每个条目来自哪个文件，出错时能说清
+	for _, fh := range headers {
+		f, err := fh.Open()
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "open "+fh.Filename+": "+err.Error())
+			return
+		}
+		raw, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fh.Filename+": read file: "+err.Error())
+			return
+		}
+
+		list, err := decodeCockpitAccounts(raw)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fh.Filename+": invalid json: "+err.Error())
+			return
+		}
+		if len(list) == 0 {
+			writeErr(w, http.StatusBadRequest, fh.Filename+": empty accounts array")
+			return
+		}
+		for _, acc := range list {
+			accounts = append(accounts, acc)
+			sources = append(sources, fh.Filename)
+		}
 	}
 
-	var total, imported, skipped int
-	var errs []string
+	// 凭证目录必须在第一次落盘前就位。login.go / apikey.go 各自在写盘前建了目录，
+	// 唯独本文件漏了：全新部署（auths/ 还没生成、也没登录过任何账号）时，写盘用的
+	// 临时文件创建直接 ENOENT，用户看到的是「导入失败」，而服务本身完全正常
+	// ——LoadDir 用 filepath.Glob，目录不存在时返回空列表且不报错，所以启动日志
+	// 一切正常（loaded 0 account(s)），问题只在导入时暴露。
+	// 放在循环外建一次：目录是进程级前置条件，逐个账号重复 MkdirAll 既无意义，
+	// 也会在部分账号失败时给出误导性错误。预览不建任何东西。
+	if !dryRun {
+		if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
+			writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
+			return
+		}
+	}
 
-	for _, acc := range accounts {
+	var total, imported, skipped, creates, overwrites int
+	var errs, warnings []string
+	seenUID := map[string]string{} // uid -> 首次出现的文件，用于批内去重
+	var toVerify []importAcct      // 池里已有、要覆盖凭据的号：先求证再落盘
+	var committed []importAcct     // 已落盘入池的号：循环后做上游动作
+
+	// commit 落盘并入池；落盘在前、入池在后：入池后选号就会用新凭据，磁盘没跟上则重启后回到旧值。
+	// verified 表示新凭据刚被 refresh 求证过：上游已把文件里的 refresh token 轮换，池里原有的那份
+	// 多半随之作废（旧导出与池里是同一条登录链时），此时落盘失败也必须把新凭据放进内存，
+	// 否则这个号就真的只能重新登录了。调用方串行调用（求证回调自己持 mu）。
+	commit := func(ia importAcct, verified bool) {
+		if err := ia.a.SaveAtomic(); err != nil {
+			if !verified {
+				skipped++
+				errs = append(errs, fmt.Sprintf("%s: save auth failed: %v", ia.src, err))
+				return
+			}
+			log.Printf("WARN: panel: import uid=%s 新凭据已求证但落盘失败，仅放入内存: %v", ia.uid, err)
+			warnings = append(warnings, fmt.Sprintf("%s: uid=%s 凭据落盘失败（%v），新令牌只在内存里生效，请检查凭证目录后重新导入一次", ia.src, ia.uid, err))
+		}
+		p.cfg.Pool.Add(ia.a)
+		p.cfg.Pool.Revive(ia.uid)
+		committed = append(committed, ia)
+		imported++
+	}
+	var mu sync.Mutex // 保护 commit 及其计数：求证回调会并发进来
+
+	for i, acc := range accounts {
+		src := sources[i]
 		uid := strings.TrimSpace(acc.UID)
 		at := strings.TrimSpace(acc.AccessToken)
 		rt := strings.TrimSpace(acc.RefreshToken)
 		if uid == "" || at == "" || rt == "" {
 			skipped++
-			errs = append(errs, fmt.Sprintf("missing required fields (id=%s)", acc.ID))
+			errs = append(errs, fmt.Sprintf("%s: missing required fields (id=%s)", src, acc.ID))
 			continue
 		}
 		if !validImportUID(uid) {
 			skipped++
-			errs = append(errs, fmt.Sprintf("invalid uid (id=%s)", acc.ID))
+			errs = append(errs, fmt.Sprintf("%s: invalid uid (id=%s)", src, acc.ID))
 			continue
 		}
+		// 批内去重：多个文件可能有重叠账号。保留第一次出现的那条（选择顺序即
+		// 提交顺序，先选的优先），后面的记跳过并说明来源，不静默丢弃。
+		if first, ok := seenUID[uid]; ok {
+			skipped++
+			if first == src {
+				errs = append(errs, fmt.Sprintf("%s: duplicate uid=%s in the same file", src, uid))
+			} else {
+				errs = append(errs, fmt.Sprintf("%s: duplicate uid=%s (already provided by %s)", src, uid, first))
+			}
+			continue
+		}
+		seenUID[uid] = src
 
 		// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
 		realm := auth.ResolveRealm("", acc.Domain)
 
-		// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
-		expiresAt := acc.ExpiresAt / 1000
+		// expires_at 先统一成毫秒再转秒：批量导出是毫秒，单账号详情导出是秒，
+		// 直接除以 1000 会把秒级值算成 1970 年（账号一进池就是「已过期」）。
+		expiresAt := normalizeExpiresAtMillis(acc.ExpiresAt) / 1000
 		if expiresAt <= 0 {
 			expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
 		}
@@ -100,6 +184,10 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(nickname) == "" {
 			nickname = acc.Email
 		}
+		enterpriseID := strings.TrimSpace(acc.EnterpriseID)
+		if enterpriseID == "" {
+			enterpriseID = strings.TrimSpace(acc.EnterpriseIDCamel)
+		}
 
 		a := &auth.Auth{
 			AccessToken:  at,
@@ -107,6 +195,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:    expiresAt,
 			Domain:       acc.Domain,
 			UID:          uid,
+			EnterpriseID: enterpriseID,
 			Nickname:     nickname,
 			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
 		}
@@ -121,48 +210,160 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			_, _ = a.BackfillRealm()
 		}
 
-		if err := a.SaveAtomic(); err != nil {
-			skipped++
-			errs = append(errs, fmt.Sprintf("uid=%s: save auth failed: %v", uid, err))
+		// 覆盖已有凭据是不可逆动作：先用 refresh 求证这份新凭据还活着，只接受
+		// 「明确活着」。起因是把一份旧 cockpit 导出重新导入时，文件里的 RT 早已被
+		// 轮换，直接覆盖会让本来能用的账号变成要重新登录——.bak 里虽然留着旧凭据，
+		// 但没有任何东西会自动拿它回退。判据用 VerifySessionByRefresh 的三态
+		// （alive/dead/inconclusive）：dead 是上游明确拒绝，inconclusive 是没判词
+		// （网络/5xx/429），后者同样不覆盖——主动销毁时没有判词就不能动手。
+		// 顺带一提：alive 分支里 a 已被 refresh 轮换过 RT，下面的落盘存的是新值。
+		existing := p.cfg.Pool.AuthByUID(uid)
+		if existing == nil {
+			creates++
+		} else {
+			overwrites++
+		}
+		if dryRun {
+			// 预览到此为止，**绝不**往上游发请求：VerifySessionByRefresh 会真的
+			// 轮换一次 refresh token（单次有效），只为看一眼就烧掉一个 RT 不行，
+			// 更别说它还会顺手改掉内存里的凭据。真实导入时这份校验照旧执行。
+			imported++
 			continue
 		}
-
-		p.cfg.Pool.Add(a)
-		p.cfg.Pool.Revive(uid)
-
-		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
-			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
-			}
-		} else {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
-			}
+		ia := importAcct{a: a, src: src, uid: uid, realm: realm, isNew: existing == nil}
+		if existing != nil {
+			toVerify = append(toVerify, ia) // 覆盖要先求证，统一在循环后有界并发地做
+			continue
 		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-		}
+		commit(ia, false)
+	}
 
-		imported++
+	// 覆盖前求证：有界并发 + 总时限（见 verifyImportOverwrites）。每个号求证完立刻落盘入池，
+	// 不等整批——求证已把文件里的 refresh token 轮换了，拖着不提交会让它只活在内存里。
+	if len(toVerify) > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), importVerifyBudget)
+		p.verifyImportOverwrites(ctx, toVerify, func(k int, verdict upstream.VerifyVerdict, ran bool) {
+			ia := toVerify[k]
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case ran && verdict == upstream.VerifyAlive:
+				commit(ia, true)
+			case !ran:
+				skipped++
+				errs = append(errs, fmt.Sprintf("%s: 批量求证超时（开工总限 %s）或请求已断开，保留原有凭据（uid=%s），请分批重试", ia.src, importVerifyBudget, ia.uid))
+			default:
+				skipped++
+				errs = append(errs, fmt.Sprintf("%s: 新凭据校验未通过（%s），保留原有凭据", ia.src, verdict))
+			}
+		})
+		cancel()
+	}
+
+	// 上游动作（签到/激活/查余额）放在落盘之后统一做：它们每号几次往返，
+	// 不能夹在求证与落盘之间拖慢已轮换令牌的提交。
+	for _, ia := range committed {
+		p.importFollowUp(ia)
 	}
 
 	total = len(accounts)
-	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
+	if dryRun {
+		log.Printf("panel: cockpit import preview total=%d would_import=%d skipped=%d creates=%d overwrites=%d",
+			total, imported, skipped, creates, overwrites)
+	} else {
+		log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d creates=%d overwrites=%d",
+			total, imported, skipped, creates, overwrites)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"total":    total,
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errs,
+		"ok":         true,
+		"dry_run":    dryRun,
+		"total":      total,
+		"imported":   imported, // dryRun 时是「将会导入」的条数
+		"skipped":    skipped,
+		"creates":    creates,
+		"overwrites": overwrites,
+		"errors":     errs,
+		"warnings":   warnings, // 已入池但凭据没能落盘的号（新令牌只在内存里）
 	})
+}
+
+// importAcct 一个通过本地校验、待落盘的导入账号。
+type importAcct struct {
+	a        *auth.Auth
+	src, uid string
+	realm    string
+	isNew    bool // 池里原先没有：导入后启动新号任务
+}
+
+// importVerifyConcurrency 覆盖前求证（每号一次 refresh）的并发上限：串行时几百个已有号要等几十分钟，
+// 请求先被反向代理 / 浏览器掐断；并发太高又像批量刷 refresh 端点。
+// importVerifyBudget 是求证「开工」的总时限：到点后不再为没轮到的号发 refresh，它们一律保留原凭据、
+// 由人分批重试。已发出的 refresh 不打断（打断会丢掉已轮换的令牌），所以请求最坏要等
+// importVerifyBudget + 一次 refresh 的超时。两者是变量只为让测试不必真等 60 秒。
+var (
+	importVerifyConcurrency = 8
+	importVerifyBudget      = 60 * time.Second
+)
+
+// verifyImportOverwrites 用 refresh 求证导入的新凭据还活着，有界并发，开工受 ctx 约束。每号求证完立刻调
+// done（并发调用，调用方自己加锁）；没轮到的号也调一次（ran=false），保证每个号恰好一次回调。
+func (p *Panel) verifyImportOverwrites(ctx context.Context, list []importAcct, done func(k int, verdict upstream.VerifyVerdict, ran bool)) {
+	sem := make(chan struct{}, importVerifyConcurrency)
+	var wg sync.WaitGroup
+	k := 0
+loop:
+	for ; k < len(list); k++ {
+		// select 在两路都就绪时随机选一路，先判一次 ctx，已结束就一个也不再发。
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
+		wg.Add(1)
+		go func(k int) {
+			defer func() { <-sem; wg.Done() }()
+			done(k, p.cfg.Upstream.VerifySessionByRefresh(list[k].a), true)
+		}(k)
+	}
+	for ; k < len(list); k++ {
+		done(k, upstream.VerifyInconclusive, false)
+	}
+	wg.Wait()
+}
+
+// importFollowUp 导入后顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
+func (p *Panel) importFollowUp(ia importAcct) {
+	a, uid := ia.a, ia.uid
+	if ia.realm == "global" {
+		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+			log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
+		} else if activated {
+			log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
+		}
+		if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+			log.Printf("panel: import global trial uid=%s: %v", uid, err)
+		} else if claimed {
+			log.Printf("panel: import global trial uid=%s 已领", uid)
+		}
+	} else {
+		// 企业版 / 静态 API Key 无个人成长体系：CN 签到端点对企业号直接
+		// 400 code 10001「企业账号不支持该操作」。跳过签到，但下方余额查询
+		// 照常（企业额度走 get-enterprise-user-usage 口径）。
+		if !a.SupportsPersonalGrowth() {
+			log.Printf("panel: import 跳过签到 uid=%s（企业版/API Key 无个人成长体系）", uid)
+		} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+			log.Printf("panel: import checkin uid=%s: %v", uid, err)
+		}
+	}
+	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+	}
+	if ia.isNew {
+		p.StartNewAccountTasks(uid)
+	}
 }
 
 // validImportUID 校验导入 uid 是否可用于拼文件名（同 login.go validUID 口径）。
@@ -178,4 +379,217 @@ func validImportUID(uid string) bool {
 		}
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// 导入格式归一化
+// ---------------------------------------------------------------------------
+
+// nestedCockpit 是 cockpit tools「账号详情」导出的嵌套形态：
+//
+//	{"account":{"uid":"…","nickname":"…"},"auth":{"accessToken":"…","refreshToken":"…"}}
+//
+// 同一个导出工具会产出两种形态：批量导出是「顶层数组 + snake_case」，单账号详情
+// 导出是上面这种嵌套驼峰。用户不会区分，故在解码处统一，而不是让人手工改写。
+type nestedCockpit struct {
+	Account struct {
+		UID           string `json:"uid"`
+		Nickname      string `json:"nickname"`
+		EnterpriseID  string `json:"enterpriseId"`
+		EnterpriseID2 string `json:"enterprise_id"`
+	} `json:"account"`
+	Auth struct {
+		AccessToken   string `json:"accessToken"`
+		AccessToken2  string `json:"access_token"`
+		RefreshToken  string `json:"refreshToken"`
+		RefreshToken2 string `json:"refresh_token"`
+		Domain        string `json:"domain"`
+		ExpiresAt     int64  `json:"expiresAt"`
+		ExpiresAt2    int64  `json:"expires_at"`
+	} `json:"auth"`
+}
+
+// decodeCockpitAccounts 把导入 JSON 归一成账号列表。接受：
+//   - 顶层数组（批量导出）
+//   - 单个扁平对象（蛇形或驼峰）
+//   - 单个嵌套对象 {account,auth}（账号详情导出）
+//   - 信封 {accounts|data|list|items|results|auths: [...]}
+//   - 字典 {"<uid>": {...}}（键即 uid）
+//
+// 认不出的结构才返回 error（调用方转 400）；认得出但缺字段的条目照旧进主循环
+// 记 skipped——错误信息里要能说出是哪一条，不能被解码层吞掉。
+func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty body")
+	}
+	switch trimmed[0] {
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			return nil, err
+		}
+		return decodeCockpitItems(items), nil
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return nil, err
+		}
+		for _, k := range []string{"accounts", "data", "list", "items", "results", "auths"} {
+			sub, ok := obj[k]
+			if !ok {
+				continue
+			}
+			var items []json.RawMessage
+			if err := json.Unmarshal(sub, &items); err == nil {
+				return decodeCockpitItems(items), nil
+			}
+			// 信封的值是**单个账号对象**（用户把单账号详情又包了一层）：
+			// 按条目解，但绝不能拿信封键当 uid——见字典分支的说明。
+			if acc, ok := decodeCockpitOne(sub); ok {
+				return []cockpitAccount{acc}, nil
+			}
+		}
+		if _, ok := obj["account"]; ok {
+			return decodeCockpitItems([]json.RawMessage{trimmed}), nil
+		}
+		if _, ok := obj["auth"]; ok {
+			return decodeCockpitItems([]json.RawMessage{trimmed}), nil
+		}
+		if acc, ok := decodeCockpitOne(trimmed); ok {
+			return []cockpitAccount{acc}, nil
+		}
+		// 字典：{"<uid>": {...}}，键当 uid 兜底
+		//
+		// 信封名不能当 uid：`{"accounts":{"refresh_token":"r"}}` 是「信封的值是单个
+		// 对象」形态，走到这里时 accounts 这个键会命中内层（有 token），兜底就会把
+		// 账号的 uid 写成字面量 "accounts"——池里从此多一个格式合法、内容垃圾的号。
+		// 信封名本身不是 uid（真实 uid 是手机号/UUID），直接跳过。
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			if isCockpitEnvelopeKey(k) {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // 稳定顺序，便于前端展示与测试比对
+		out := make([]cockpitAccount, 0, len(keys))
+		for _, k := range keys {
+			acc, ok := decodeCockpitOne(obj[k])
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(acc.UID) == "" {
+				acc.UID = k
+			}
+			out = append(out, acc)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("无法识别的 JSON 结构：既不是账号数组，也不是 {account,auth} 或 {\"<uid>\":{…}}")
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("expected JSON array or object")
+	}
+}
+
+// isCockpitEnvelopeKey 报告键名是否是导出工具的信封名（不是 uid）。
+func isCockpitEnvelopeKey(k string) bool {
+	for _, e := range []string{"accounts", "data", "list", "items", "results", "auths"} {
+		if strings.EqualFold(strings.TrimSpace(k), e) {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeCockpitItems 逐条解码；认不出的条目保留一个空占位，
+// 让主循环按「missing required fields」记账，而不是从结果里凭空消失。
+func decodeCockpitItems(items []json.RawMessage) []cockpitAccount {
+	out := make([]cockpitAccount, 0, len(items))
+	for _, it := range items {
+		if acc, ok := decodeCockpitOne(it); ok {
+			out = append(out, acc)
+			continue
+		}
+		out = append(out, cockpitAccount{})
+	}
+	return out
+}
+
+// decodeCockpitOne 依次尝试：蛇形扁平 → 驼峰扁平 → {account,auth} 嵌套。
+// 判据统一是「拿到至少一个 token」：cockpitAccount 的 tag 是蛇形，直接
+// Unmarshal 一个驼峰对象会成功但字段全空，不检查就会把有效账号当成空账号。
+func decodeCockpitOne(raw json.RawMessage) (cockpitAccount, bool) {
+	var a cockpitAccount
+	if err := json.Unmarshal(raw, &a); err == nil && (a.AccessToken != "" || a.RefreshToken != "") {
+		return a, true
+	}
+	var f struct {
+		UID          string `json:"uid"`
+		Nickname     string `json:"nickname"`
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Domain       string `json:"domain"`
+		EnterpriseID string `json:"enterpriseId"`
+	}
+	if err := json.Unmarshal(raw, &f); err == nil && (f.AccessToken != "" || f.RefreshToken != "") {
+		a.UID = f.UID
+		a.Nickname = f.Nickname
+		a.AccessToken = f.AccessToken
+		a.RefreshToken = f.RefreshToken
+		a.ExpiresAt = f.ExpiresAt
+		a.Domain = f.Domain
+		a.EnterpriseIDCamel = f.EnterpriseID
+		return a, true
+	}
+	var n nestedCockpit
+	if err := json.Unmarshal(raw, &n); err == nil {
+		at := firstNonEmpty(n.Auth.AccessToken, n.Auth.AccessToken2)
+		rt := firstNonEmpty(n.Auth.RefreshToken, n.Auth.RefreshToken2)
+		if at != "" || rt != "" {
+			return cockpitAccount{
+				UID:               n.Account.UID,
+				Nickname:          n.Account.Nickname,
+				EnterpriseIDCamel: firstNonEmpty(n.Account.EnterpriseID, n.Account.EnterpriseID2),
+				AccessToken:       at,
+				RefreshToken:      rt,
+				Domain:            n.Auth.Domain,
+				ExpiresAt:         firstNonZero(n.Auth.ExpiresAt, n.Auth.ExpiresAt2),
+			}, true
+		}
+	}
+	return a, false
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+func firstNonZero(v ...int64) int64 {
+	for _, n := range v {
+		if n != 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// normalizeExpiresAtMillis 把 expires_at 统一成毫秒。
+// 批量导出是毫秒（≈1.7e12），单账号详情导出是秒（≈1.7e9）。
+// 以 1e11 分界：秒制要走 3000 年才到这个数，毫秒制的历史值也远大于它。
+func normalizeExpiresAtMillis(v int64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	if v < 1e11 {
+		return v * 1000
+	}
+	return v
 }

@@ -1,11 +1,18 @@
-# syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.10-alpine AS build
+# Go module 代理：默认官方源（境外/CI 不多绕一跳）；境内或镜像环境用
+# --build-arg 覆盖，容器内直连 proxy.golang.org 在境内会长时间卡住：
+#   docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+# 也可写进 .env（compose 会把 .env 变量当 build-arg 传入）。
+# direct 兜底：代理未收录的模块仍能直接回源，不会因缺包而构建失败。
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
+ARG APP_VERSION=dev
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VERSION}" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit

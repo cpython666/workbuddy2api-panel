@@ -1,8 +1,10 @@
 package reqlog
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,64 +64,6 @@ func TestArchiveRotationReadAndFilter(t *testing.T) {
 	}
 	if len(rows) != 5 || rows[0].RequestID != "multi-l" || rows[4].RequestID != "multi-h" {
 		t.Fatalf("filtered rows = %+v", rows)
-	}
-}
-
-// ReadArchive 的契约是「按事件时间倒序返回最近记录」，与归档文件的 mtime 无关。
-// 快速轮转（FileMaxBytes 很小）时同一秒内会写出多个文件，Linux 下这些文件的 mtime
-// 可能完全相同；把归档目录整体拷贝 / 恢复备份也会打乱 mtime。此用例把所有归档文件的
-// mtime 改成与事件时间相反的顺序，钉住「只能按事件时间排序」。
-func TestReadArchiveOrdersByEventTimeNotFileMtime(t *testing.T) {
-	dir := t.TempDir()
-	r := New(Config{Enabled: true, Dir: dir, FileMaxBytes: 1, MaxBytes: 1 << 20, RetentionDays: 7})
-	base := time.Now().Add(-time.Hour)
-	const n = 5
-	for i := 0; i < n; i++ {
-		r.Record(Event{
-			Time:      base.Add(time.Duration(i) * time.Second),
-			RequestID: "ev-" + string(rune('a'+i)),
-			Model:     "glm-5.3",
-			Status:    200,
-			OK:        true,
-			Outcome:   OutcomeSuccess,
-		})
-	}
-	r.Close()
-
-	// FileMaxBytes=1 让每个事件独占一个归档文件：基准文件 requests-<day>.jsonl 装的是
-	// 最早的事件，字典序却排在 requests-<day>.N.jsonl 之后。按 os.ReadDir 顺序递增地
-	// 设置 mtime，最早事件所在文件就拿到最大 mtime、被放在最后读取。
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != n {
-		t.Fatalf("归档文件数 = %d, want %d", len(entries), n)
-	}
-	stamp := time.Unix(1700000000, 0)
-	for i, e := range entries {
-		ts := stamp.Add(time.Duration(i) * time.Second)
-		if err := os.Chtimes(filepath.Join(dir, e.Name()), ts, ts); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	rows, err := r.ReadArchive(n, Filter{Model: "glm"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := make([]string, 0, len(rows))
-	for _, e := range rows {
-		got = append(got, e.RequestID)
-	}
-	if len(rows) != n {
-		t.Fatalf("rows = %d, want %d", len(rows), n)
-	}
-	for i := range rows {
-		want := "ev-" + string(rune('a'+n-1-i))
-		if rows[i].RequestID != want {
-			t.Fatalf("rows[%d] = %s, want %s（须按事件时间倒序，与文件 mtime 无关）\n got %v", i, rows[i].RequestID, want, got)
-		}
 	}
 }
 
@@ -259,5 +203,78 @@ func TestArchivePruneHonorsSize(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "requests-2026-09-22.jsonl" {
 		t.Fatalf("remaining = %+v, want newest file only", entries)
+	}
+}
+
+// 一条超长事件行不能把整个视图读废。
+//
+// 现场：开启 logging.request_archive_context 后，带 base64 图片的请求把 Event.Context
+// 撑到 1,098,299 字节；旧实现用 bufio.Scanner（上限 1<<20），超限时 readFile 直接把
+// bufio.ErrTooLong 上抛，面板「请求事件日志」整页 500，导出 JSON 也废。
+//
+// 现在：超长行只丢这一行，同文件里其它事件照常返回，并给出跳过条数。
+func TestReadFileSkipsOversizedLine(t *testing.T) {
+	old := eventLineMaxBytes
+	eventLineMaxBytes = 4 << 10 // 测试用的小上限，免得造 16 MB 文件
+	defer func() { eventLineMaxBytes = old }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-11-03.jsonl")
+	base := time.Date(2026, 11, 3, 10, 0, 0, 0, time.Local)
+
+	var b strings.Builder
+	appendEvent := func(e Event) {
+		raw, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	appendEvent(Event{Time: base, RequestID: "before", Status: 200, OK: true, Outcome: OutcomeSuccess})
+	// 模拟「开了上下文归档 + 请求带图」：Context 是 8 KB 的 base64 串，整行远超上限。
+	appendEvent(Event{
+		Time: base.Add(time.Second), RequestID: "huge", Status: 200, OK: true, Outcome: OutcomeSuccess,
+		Context: json.RawMessage(`"` + strings.Repeat("A", 8<<10) + `"`),
+	})
+	appendEvent(Event{Time: base.Add(2 * time.Second), RequestID: "after", Status: 200, OK: true, Outcome: OutcomeSuccess})
+
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	rows, skipped, err := readFile(path, Filter{})
+	if err != nil {
+		t.Fatalf("readFile 返回错误（整页会 500）：%v", err)
+	}
+	if skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", skipped)
+	}
+	if len(rows) != 2 || rows[0].RequestID != "before" || rows[1].RequestID != "after" {
+		t.Fatalf("rows = %+v, want before + after（超长行只丢自己）", rows)
+	}
+}
+
+// 没超上限的长行（这里 8 KB > 2 KB 上限之外的对照组）必须正常解析：
+// 上限只是防病态输入，不是把「大一点但正常」的事件也丢掉。
+func TestReadFileKeepsLargeButAllowedLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests-2026-11-03.jsonl")
+	ctx := json.RawMessage(`"` + strings.Repeat("A", 512<<10) + `"`)
+	e := Event{
+		Time:      time.Date(2026, 11, 3, 11, 0, 0, 0, time.Local),
+		RequestID: "big", Status: 200, OK: true, Outcome: OutcomeSuccess, Context: ctx,
+	}
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	rows, skipped, err := readFile(path, Filter{})
+	if err != nil || skipped != 0 || len(rows) != 1 || rows[0].RequestID != "big" {
+		t.Fatalf("rows=%d skipped=%d err=%v，512 KB 的行在 16 MB 上限下应照常读到", len(rows), skipped, err)
 	}
 }

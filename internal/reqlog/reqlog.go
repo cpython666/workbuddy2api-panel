@@ -1,16 +1,21 @@
 // Package reqlog 记录脱敏的请求级指标与可选 JSONL 归档。
 //
 // 内存指标有界保存最近 100 条并维护进程级计数；磁盘归档只写请求元数据，
-// 不写提示词、响应正文、Authorization 或其它凭证。可选的调用来源（客户端 IP /
-// User-Agent，见 Event.ClientIP/UserAgent）由 server 按配置开关决定是否填充。
+// 不写响应正文、Authorization 或其它凭证。可选的调用来源（客户端 IP / User-Agent，
+// 见 Event.ClientIP/UserAgent）与会话上下文（见 Event.Context）都由 server 按配置
+// 开关决定是否填充——提示词默认不落盘。
 // 归档队列满时丢弃并计数，不允许日志写盘阻塞模型请求。
 package reqlog
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -62,28 +67,58 @@ type Config struct {
 // 归档里不会出现来源字段）——来源信息比 token 计数敏感，运营可自行决定是否落盘。
 // 仍然不写提示词、响应正文、Authorization 或其它凭证。
 type Event struct {
-	Time             time.Time `json:"time"`
-	RequestID        string    `json:"request_id"`
-	Path             string    `json:"path"`
-	Account          string    `json:"account,omitempty"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	OK               bool      `json:"ok"`
-	Outcome          string    `json:"outcome"`
-	DurationMs       int64     `json:"duration_ms"`
-	TTFBMs           int64     `json:"ttfb_ms,omitempty"`
-	Attempts         int       `json:"attempts,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	Credit           float64   `json:"credit,omitempty"`
-	HasCredit        bool      `json:"credit_known"`
-	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
+	Time      time.Time `json:"time"`
+	RequestID string    `json:"request_id"`
+	Path      string    `json:"path"`
+	Account   string    `json:"account,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	// ModelEff 模型降级（pool.model_fallback / model_unavailable_fallback）后**实际
+	// 使用**的模型（2026-10-25 实案）：只记 Model 会让「global:deepseek-v4.1-flash」
+	// 与实际在跑的「deepseek-v4.1-flash-sg」归为一类——两者计价/能力都不同，
+	// 归档与面板请求记录必须分开可辨。空 = 未降级。
+	ModelEff string `json:"model_eff,omitempty"`
+	// Realm 实际服务本次请求的账号所在域（cn / global）。cn 与 global 有同名模型，
+	// 而 Model / ModelEff 常是不带域前缀的裸名：面板的模型可用性靠它区分
+	// 「这条成功流量属于哪个域的模型」，缺了它裸名只能两边都认。空 = 没选到账号。
+	Realm            string  `json:"realm,omitempty"`
+	Status           int     `json:"status"`
+	OK               bool    `json:"ok"`
+	Outcome          string  `json:"outcome"`
+	DurationMs       int64   `json:"duration_ms"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
+	Attempts         int     `json:"attempts,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
+	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92 同步）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	Mode            string `json:"mode,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ReasoningEffortRequested 客户端原始请求的思考档位（reasoning_effort / reasoningEffort
+	// 原值；空字符串 = 客户端没携带）。与上一列（生效值）配对：生效值可能来自网关补默认档、
+	// 策略改写或就近降级——只给生效值时，「客户端要了 max」与「客户端什么都没发、网关补了
+	// max」在事件页/JSONL 里长得一模一样（issue #43 的读法歧义）。
+	// **刻意不带 omitempty**：旧归档行没有这个键（「不知道客户端发了什么」），新行恒有
+	// （空串「确认客户端没发」）——两种情况在事件页里要能分开。
+	ReasoningEffortRequested string `json:"reasoning_effort_requested"`
+	ReasoningTokens          int64  `json:"reasoning_tokens,omitempty"`
+	ExecutorType             string `json:"executor_type,omitempty"`
+	// ToolsDeclared / ToolCalls 本轮的「工具面」观测量（issue #44）：声明了几个工具、
+	// 实际拿到几个工具调用。ToolsDeclared>0 且 ToolCalls==0 就是一次「零工具调用
+	// 收尾」——上游把本该调工具的回合当成正常完成，客户端据此认为任务做完、工具一次
+	// 没跑。只记数量，不记工具名与参数。
+	ToolsDeclared int `json:"tools_declared,omitempty"`
+	ToolCalls     int `json:"tool_calls,omitempty"`
+	// Context 本轮请求的会话上下文（system + messages，或出图/embedding 的 prompt），
+	// 由 logging.request_archive_context 决定是否填充（缺省关，空则省略）。
+	// 这是用户数据：默认不开，开了等于把提示词落到 state 目录的归档文件里。
+	Context json.RawMessage `json:"context,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -230,6 +265,23 @@ func (r *Recorder) ReadArchive(limit int, filter Filter) ([]Event, error) {
 	return r.archive.read(limit, filter)
 }
 
+// PurgeResult 清空归档的结果：解掉的字节数 + 删掉的文件数。
+// 字节数给面板显示「清了多少」，文件数给测试断言（解掉 0 字节 ≠ 没删文件）。
+type PurgeResult struct {
+	Files int   `json:"files"`
+	Bytes int64 `json:"bytes"`
+}
+
+// Purge 清空归档目录里的请求事件文件（面板「清空归档」）。返回删除量。
+// 只删 requests-*.jsonl（与定期 prune 同口径），目录里其它文件不碰。
+// 归档关闭时返回零值：没有可清的东西，不算失败。
+func (r *Recorder) Purge() (PurgeResult, error) {
+	if r == nil || r.archive == nil {
+		return PurgeResult{}, nil
+	}
+	return r.archive.purge()
+}
+
 // Close 刷盘并停止后台归档。
 func (r *Recorder) Close() {
 	if r == nil || r.archive == nil {
@@ -245,6 +297,7 @@ func round1(v float64) float64 {
 type archiveWriter struct {
 	cfg       Config
 	ch        chan Event
+	purgeCh   chan chan PurgeResult // 手动清空归档：删文件必须由写循环执行（它是 file/buf 唯一持有者），否则会把在写的文件删成「已删除但仍在写」
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
@@ -276,10 +329,11 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 		cfg.QueueSize = defaultQueue
 	}
 	w := &archiveWriter{
-		cfg:  cfg,
-		ch:   make(chan Event, cfg.QueueSize),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		cfg:     cfg,
+		ch:      make(chan Event, cfg.QueueSize),
+		purgeCh: make(chan chan PurgeResult),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		w.setErr(err)
@@ -314,6 +368,8 @@ func (w *archiveWriter) run() {
 		select {
 		case e := <-w.ch:
 			w.writeEvent(e)
+		case out := <-w.purgeCh:
+			out <- w.purgeNow()
 		case <-ticker.C:
 			w.flush()
 			w.prune()
@@ -468,6 +524,66 @@ func (w *archiveWriter) closeFile() {
 	w.size = 0
 }
 
+// drain 把写入队列里已入队的事件全部写掉（非阻塞，队列空即返回）。
+func (w *archiveWriter) drain() {
+	for {
+		select {
+		case e := <-w.ch:
+			w.writeEvent(e)
+		default:
+			return
+		}
+	}
+}
+
+// purge 把清空请求交给写循环并等它做完。归档已停止（done 关闭）时直接返回错误，
+// 否则会永久阻塞调用方（HTTP handler 卡死）。
+//
+// purgeCh 必须无缓冲：发送成功就说明写循环已经收下请求，它一定会回结果。带缓冲时，
+// 写循环退出后（或正选中 stop 分支时）请求照样能发进通道却没人处理，<-out 永远等不到。
+func (w *archiveWriter) purge() (PurgeResult, error) {
+	if !w.enabled() {
+		return PurgeResult{}, nil
+	}
+	out := make(chan PurgeResult, 1)
+	select {
+	case w.purgeCh <- out:
+	case <-w.done:
+		return PurgeResult{}, errors.New("请求归档已停止，无法清理")
+	}
+	return <-out, nil
+}
+
+// purgeNow 在写循环内清空归档：先落盘关文件（否则删掉的 inode 还在被 buf 写），
+// 再按 prune 同口径删 requests-*.jsonl。closeFile 已把 day 清空，下一条事件会重开新文件。
+// 只能由 run() 调用——file/buf 归写循环所有，其他 goroutine 碰会与写入竞争。
+func (w *archiveWriter) purgeNow() PurgeResult {
+	// 先把队列里待写的事件写完再删：Record 是异步入队的，直接删会让「刚记录的 N 条」
+	// 在删除之后才落盘 —— 文件立刻又出现，清不干净。
+	w.drain()
+	w.flush()
+	w.closeFile()
+	entries, err := os.ReadDir(w.cfg.Dir)
+	if err != nil {
+		return PurgeResult{}
+	}
+	var out PurgeResult
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "requests-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(w.cfg.Dir, entry.Name())
+		info, statErr := entry.Info()
+		if err := os.Remove(path); err == nil {
+			out.Files++
+			if statErr == nil {
+				out.Bytes += info.Size()
+			}
+		}
+	}
+	return out
+}
+
 func (w *archiveWriter) prune() {
 	if !w.enabled() {
 		return
@@ -526,47 +642,186 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
-	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗），
-	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
-	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
-	var out []Event
+	type fileItem struct {
+		path  string
+		mtime time.Time
+		day   time.Time // 文件名日期零点；零值 = 解析不出（保守参与读取，不参与短路）
+	}
+	files := make([]fileItem, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileItem{path: filepath.Join(w.cfg.Dir, name), mtime: info.ModTime(), day: archiveFileDay(name)})
+	}
+	// 新日期在前（同日内 mtime 新的在前）：配合下方「集满即停」，面板日志视图的
+	// 「最近 N 条」不必再解析整个归档（上限 100MB，且每 5s 轮询放大一次）。
+	sort.Slice(files, func(i, j int) bool {
+		di, dj := files[i].day, files[j].day
+		if !di.Equal(dj) {
+			if di.IsZero() {
+				return false
+			}
+			if dj.IsZero() {
+				return true
+			}
+			return di.After(dj)
+		}
+		return files[i].mtime.After(files[j].mtime)
+	})
+	var out []Event
+	maxDay := time.Time{}
+	totalSkipped := 0
+	for _, file := range files {
+		if archiveWindowSkips(file.day, filter) {
+			continue
+		}
+		// 已集满 limit 且当前文件属于更早的日期：它的事件全部早于已收集的每个
+		// 事件（按天归档保证），不可能进入「最近 limit 条」，后续文件只会更旧。
+		if len(out) >= limit && !file.day.IsZero() && !maxDay.IsZero() && file.day.Before(maxDay) {
+			break
+		}
+		rows, skipped, err := readFile(file.path, filter)
 		if err != nil {
 			return out, err
 		}
 		out = append(out, rows...)
+		totalSkipped += skipped
+		if file.day.After(maxDay) {
+			maxDay = file.day
+		}
 	}
-	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+	if totalSkipped > 0 {
+		// 一条脏行不该让整页失败，但也不能悄悄吞掉：汇总成一行日志，
+		// 便于看出是不是开了 logging.request_archive_context、客户端又在请求里带了图片。
+		log.Printf("reqlog: 跳过 %d 行超长事件（单行超过 %d 字节）；常见于开启 request_archive_context 且请求带图片", totalSkipped, eventLineMaxBytes)
+	}
+	// 按事件时间排序，而不是依赖文件 mtime 顺序：分片文件在同一毫秒内落盘时
+	// mtime 可能完全相同（粗粒度时间戳的文件系统），文件顺序随机 → 「最近 N 条」取错样本。
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	if len(out) > limit {
-		out = out[:limit]
+		out = out[len(out)-limit:]
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }
 
-func readFile(path string, filter Filter) ([]Event, error) {
+// archiveFileDay 从 requests-YYYY-MM-DD*.jsonl 文件名提取日期零点（本地时区，
+// 与归档写入的 day 同口径）；解析不出返回零值——保守处理：照常读取、不参与
+// 窗口短路与提前停止。
+func archiveFileDay(name string) time.Time {
+	s := strings.TrimSuffix(strings.TrimPrefix(name, "requests-"), ".jsonl")
+	if len(s) < 10 {
+		return time.Time{}
+	}
+	day, err := time.ParseInLocation("2006-01-02", s[:10], time.Local)
+	if err != nil {
+		return time.Time{}
+	}
+	return day
+}
+
+// archiveWindowSkips 文件级时间窗短路：归档按天分片（事件全部落在
+// [day, day+1) 内），与 Filter.From/To 无交集的文件整档跳过，不再读入解析。
+func archiveWindowSkips(day time.Time, filter Filter) bool {
+	if day.IsZero() {
+		return false
+	}
+	if !filter.To.IsZero() && filter.To.Before(day) {
+		return true
+	}
+	if !filter.From.IsZero() && !filter.From.Before(day.AddDate(0, 0, 1)) {
+		return true
+	}
+	return false
+}
+
+// eventLineMaxBytes 单条事件行的读取上限。
+//
+// 归档里一行事件通常几百字节；但启用 logging.request_archive_context 时，Event.Context
+// 会带上整轮 system+messages——客户端塞一张 base64 图片就是 1 MB 级（线上实测出现过
+// 1,098,299 字节的单行）。原先用 bufio.Scanner（上限 1<<20）读：超限时 Scan 返回 false、
+// Err() 得到 bufio.ErrTooLong，readFile 把错误原样上抛、read() 立刻中断，结果「一条脏行
+// → 整个请求事件日志页 500」。
+//
+// 现在分两层兜：上限抬到 16 MB（覆盖常见带图请求，这类行仍能正常解析），超过上限的行
+// 只丢该行、不打断同文件里其余事件；丢弃条数在 read() 里汇总成一行日志。
+var eventLineMaxBytes = 16 << 20
+
+// nextLine 从 r 切出下一行（不含行尾换行符）。
+//
+// 与 bufio.Scanner 的差别：某一行过长不会让 reader 报废——超限的部分照样读到换行、
+// 但内容丢弃（tooLong=true），调用方跳过后还能继续读下一行。
+func nextLine(r *bufio.Reader, max int) (line []byte, tooLong bool, err error) {
+	var buf []byte
+	for {
+		chunk, rerr := r.ReadSlice('\n')
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong = true
+				buf = nil // 已经确定要丢，别再累积内存
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if rerr == bufio.ErrBufferFull {
+			continue // 本行还没结束
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				if tooLong {
+					return nil, true, io.EOF
+				}
+				if len(buf) == 0 {
+					return nil, false, io.EOF
+				}
+				return bytes.TrimRight(buf, "\r\n"), false, io.EOF
+			}
+			return nil, tooLong, rerr
+		}
+		if tooLong {
+			return nil, true, nil
+		}
+		return bytes.TrimRight(buf, "\r\n"), false, nil
+	}
+}
+
+func readFile(path string, filter Filter) ([]Event, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+
+	// 不能再用 bufio.Scanner：它一旦遇到超长行就报废整个 reader（Scan 返回 false、
+	// Err() 得到 bufio.ErrTooLong），没法「跳过这一行接着读」。
+	r := bufio.NewReaderSize(f, 64<<10)
 	var out []Event
-	for scanner.Scan() {
-		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(e) {
-			continue
+	skipped := 0
+	for {
+		line, tooLong, err := nextLine(r, eventLineMaxBytes)
+		if tooLong {
+			skipped++
+		} else if len(line) > 0 {
+			var e Event
+			if json.Unmarshal(line, &e) == nil && filter.match(e) {
+				out = append(out, e)
+			}
 		}
-		out = append(out, e)
+		if err != nil {
+			if err == io.EOF {
+				return out, skipped, nil
+			}
+			return out, skipped, err
+		}
 	}
-	return out, scanner.Err()
 }
 
 func (f Filter) match(e Event) bool {
@@ -576,7 +831,7 @@ func (f Filter) match(e Event) bool {
 	if !containsFold(e.Account, f.Account) {
 		return false
 	}
-	if !containsFold(e.Model, f.Model) {
+	if !containsFold(e.Model, f.Model) && !containsFold(e.ModelEff, f.Model) {
 		return false
 	}
 	if !containsFold(e.ClientIP, f.ClientIP) {

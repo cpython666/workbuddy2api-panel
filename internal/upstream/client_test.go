@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
 
 func TestClassify(t *testing.T) {
@@ -41,6 +41,13 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 11140 的第二种形态：内容安全审核（官方会打断会话的那条文案）。
+		// 未收录时落 ErrClient：只换号不罚号、也不走降级重试，客户端拿到必然失败的答复。
+		{400, `{"code":11140,"msg":"Content failed safety review. Please revise it"}`, ErrContentBlocked},
+		// 14003 RateLimitError：模型忙（官方文案「当前模型请求繁忙，请切换模型」），
+		// 不是额度耗尽；200 信封形态也必须归软限流（否则账号不会被停车）。
+		{429, `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"请求过于频繁，请稍后重试。"}}`, ErrSoftRate},
+		{200, `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"请求过于频繁，请稍后重试。"}}`, ErrSoftRate},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
@@ -56,8 +63,17 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 防过宽：11133（模型不支持图片）不进 image_invalid——它自成一类确定性请求级
+		// 错误（ErrModelParamInvalid），与 11135/11115 同待遇：不轮转、不罚号、末端 400 透传。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrModelParamInvalid},
+		// 11133 家族实测形态（缺/空 messages）：extError.param=messages + StatusCode 400。
+		{400, `{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"400002","param":"messages","type":"invalid_request_error","StatusCode":400}}`, ErrModelParamInvalid},
+		{400, `{"code":"11133","msg":"model_param_invalid"}`, ErrModelParamInvalid},
+		{400, `invalid request parameters`, ErrModelParamInvalid},
+		{400, `the request parameters do not meet the current model requirements`, ErrModelParamInvalid},
+		// 状态码先于业务码：429/5xx 上的 11133 不得抢走限流/服务端语义。
+		{429, `{"code":11133,"msg":"the request parameters were rejected"}`, ErrSoftRate},
+		{503, `{"code":11133,"msg":"the request parameters were rejected"}`, ErrServer},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -71,6 +87,11 @@ func TestClassify(t *testing.T) {
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
 		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
 		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11158 是账号类型级模型权限拒绝：同一模型换有权限的账号仍可能成功，
+		// 按 (账号, 模型) 避让；不能落入 ErrClient 轮转后误报 503。
+		{400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11158","message":"model is not allowed for user type"}}`, ErrModelBlocked},
+		{429, `{"code":11158,"msg":"model is not allowed for user type"}`, ErrSoftRate},
 		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
@@ -109,6 +130,48 @@ func TestClassify(t *testing.T) {
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
+		// 网关 401（APISIX `invalid_token` 页，无业务信封）→ session 死亡，需重登。
+		// 夹具是 2026-10-17 实测原文（CN 站 /v2/chat/completions，token 被上游作废）。
+		// 旧行为落 ErrClient（只换号不罚）⇒ 死号永久留在池里，每请求刷一排 401。
+		{401, "<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center><p><em>Powered by APISIX.</em></p></body></html>", ErrSessionDead},
+		{401, ``, ErrSessionDead},
+		{401, `Unauthorized`, ErrSessionDead},
+		// 业务层 401 带信封的维持既有语义：12153 仍是 session 死亡；
+		// 其他业务码不劫持（不许把网关 401 的判定扩张到带信封的响应）。
+		{401, `{"code":12153,"msg":"12153:refresh token is invalid"}`, ErrSessionDead},
+		{401, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+		// 任意状态码都判 upstream_busy（防上游换状态码），结构化 code 主判、
+		// requestId 含 "6020"/"6021" 不误伤。
+		{429, `{"code":6020,"msg":"queue.waiting.title","requestId":"01a16e3d95b4a000e3385c807c"}`, ErrUpstreamBusy},
+		{429, `{"code":6021,"msg":"queue.full.title","requestId":"341738971737c911985e5b9e67a4eceb"}`, ErrUpstreamBusy},
+		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
+		// 防过宽：普通 429（无 queue 语义）仍是账号级软限流。
+		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
+		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
+		{429, `{"requestId":"6020","msg":"rate limit"}`, ErrSoftRate},
+		// 11134「model provider is temporarily unavailable」：供应商过载，与账号无关。
+		// 落 ErrServer 会按 5xx 罚号 + 换号，而换号撞同一 provider 且打断账号级前缀缓存
+		// （issue #188）。认结构化 code；只有文案、没有 code 的仍是普通 5xx。
+		{500, `{"code":11134,"msg":"the model provider is temporarily unavailable, please retry later or switch to another model","requestId":"01a1b4d1b3f45f4b99c406eb04d68909","retry_policy":{"retry":true,"retry_after":8}}`, ErrUpstreamBusy},
+		{503, `{"code":11134,"msg":"the model provider is temporarily unavailable"}`, ErrUpstreamBusy},
+		{500, `{"msg":"the model provider is temporarily unavailable"}`, ErrServer},
+		// 11148 工具配对断裂：请求内容级（上游「直接重试无效，请新建任务」），
+		// 换号/重试必然同样失败——不得落 ErrClient 白轮转全池。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
+		// 5xx 外壳同样认（上游对同因有时换状态码）。
+		{500, `{"code": 11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
+		// 防过宽：相邻错误码不误伤（11140 账号级风控、11115 超长各有归属）。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		{400, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		// 11151 空 text 段（a message has empty content）：请求内容级，出站前由
+		// empty_text_part.go 补位；真打到这里说明补位没覆盖，也不能轮转全池。
+		{400, `{"code":11151,"msg":"a message has empty content"}`, ErrEmptyContent},
+		{400, `{"code": 11151 , "msg":"a message has empty content"}`, ErrEmptyContent},
+		// 只认结构化 code：文案单独出现不算（用户自己的消息里可能就有这句）。
+		{400, `{"msg":"a message has empty content"}`, ErrClient},
+		// 非 400 不认（上游目前只用 400，放宽会让别的状态码误入不轮转通道）。
+		{500, `{"code":11151,"msg":"a message has empty content"}`, ErrServer},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -126,6 +189,11 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 6004：模型级限流（issue #31 的核心场景）。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		// 6000：上游新码，文案带「切换其他模型」才按模型级（2026-10-24 kimi 实测）。
+		{`{"code":6000,"msg":"您的使用量已超出频率限制，将在 2026-10-24 19:25:18 UTC+8 重置，您也可以切换其他模型继续使用。"}`, true},
+		{`{"code": 6000, "msg":"您也可以切换其他模型继续使用"}`, true},
+		// 6000 但无换模型提示：账号级，不能放宽成模型级。
+		{`{"code":6000,"msg":"账号并发超限"}`, false},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
@@ -172,6 +240,44 @@ func TestParseSoftRateReset(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestParseQueueRetryAfter 6020 排队信封的重试口径在 body（data.retry_after，
+// 实测真机：429 + code 6020，data 含 queue_position/retry_after/estimated_wait，
+// 头侧无 Retry-After）。ParseRetryAfter 只认头，拿不到这个口径——
+// parseQueueRetryAfter 补上 body 侧，供末端 429 的 Retry-After 上报使用。
+func TestParseQueueRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+		ok   bool
+	}{
+		{"6020 真机形态", `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`, 40 * time.Second, true},
+		{"retry_after=0（不该出现的边界）", `{"code":6020,"data":{"retry_after":0}}`, 0, false},
+		{"6021 无 data（queue.full 无等待口径）", `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea"}`, 0, false},
+		// 11134 供应商过载：口径在 retry_policy.retry_after（issue #188 生产实测形态）。
+		{"11134 retry_policy 形态", `{"code":11134,"msg":"the model provider is temporarily unavailable, please retry later or switch to another model","requestId":"01a1b4d1b3f45f4b99c406eb04d68909","retry_policy":{"retry":true,"retry_after":8}}`, 8 * time.Second, true},
+		{"11134 retry_policy 无 retry_after", `{"code":11134,"msg":"model unavailable","retry_policy":{"retry":true}}`, 0, false},
+		{"非 JSON", `upstream unavailable`, 0, false},
+		{"空 body", ``, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseQueueRetryAfter([]byte(c.body))
+			if ok != c.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+			}
+			if ok && got != c.want {
+				t.Errorf("got=%v want %v", got, c.want)
+			}
+		})
+	}
+	// 上限封顶：异常大的 retry_after 按 retryAfterSanity 截断，不把天文数字带回
+	//（estimated_wait 是另一个字段不会误入；防上游口径漂移）。
+	if d, ok := parseQueueRetryAfter([]byte(`{"code":6020,"data":{"retry_after":999999}}`)); !ok || d != retryAfterSanity {
+		t.Errorf("cap: got=%v,%v want %v,true", d, ok, retryAfterSanity)
 	}
 }
 
@@ -278,7 +384,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -332,6 +438,66 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 	if got, _ := m["reasoning_effort"].(string); got != "high" {
 		t.Errorf("reasoning_effort=%v want high (outbound=%s)", m["reasoning_effort"], outbound)
+	}
+}
+
+func TestEffortPolicyWiredThroughChatStream(t *testing.T) {
+	// 策略接线测试：SetEffortPolicy → prepareBody → 出站 JSON。单元测试直接调
+	// applyEffortPolicy，这条补上「客户端实例真的把策略带进请求」的缺口。
+	var outbound []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
+			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
+		default:
+			outbound, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	if _, err := c.FetchModels(a); err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	send := func(body string) map[string]any {
+		t.Helper()
+		rc, status, _, err := c.ChatStream(a, []byte(body), "", ChatMeta{})
+		if err != nil || status != 200 {
+			t.Fatalf("chat: status=%d err=%v", status, err)
+		}
+		rc.Close()
+		var m map[string]any
+		if err := json.Unmarshal(outbound, &m); err != nil {
+			t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
+		}
+		return m
+	}
+
+	c.SetEffortPolicy(&EffortPolicy{Enabled: true, DefaultEffort: "max", OverrideScope: OverrideScopeLevel})
+	// 客户端没发档位 → 网关补 max 解析后的最高档 high
+	if got := send(`{"model":"glm-5.2","messages":[]}`)["reasoning_effort"]; got != "high" {
+		t.Errorf("filled effort=%v want high", got)
+	}
+	// 网关优先 → 客户端 low 被改写 high
+	if got := send(`{"model":"glm-5.2","reasoning_effort":"low","messages":[]}`)["reasoning_effort"]; got != "high" {
+		t.Errorf("gateway-priority effort=%v want high", got)
+	}
+	// 客户端优先 → 保留 low
+	c.SetEffortPolicy(&EffortPolicy{Enabled: true, ClientPriority: true, DefaultEffort: "max"})
+	if got := send(`{"model":"glm-5.2","reasoning_effort":"low","messages":[]}`)["reasoning_effort"]; got != "low" {
+		t.Errorf("client-priority effort=%v want low", got)
+	}
+	// 策略关闭 → 逐字节透传（只剩既有的支持档钳制，low 本身合规）
+	c.SetEffortPolicy(&EffortPolicy{Enabled: false, DefaultEffort: "max"})
+	if got := send(`{"model":"glm-5.2","messages":[]}`)["reasoning_effort"]; got != nil {
+		t.Errorf("policy off should not inject, got %v", got)
 	}
 }
 
@@ -470,6 +636,78 @@ func TestBasesAlwaysCN(t *testing.T) {
 	}
 }
 
+// TestGlobalBaseByDomain 覆盖 global 域按 auth 文件 domain 选上游主机：
+// codebuddy.ai → 官方国际站，workbuddy.ai → 旧桌面端，其它/空 → 默认（官方国际站）。
+//
+// 为什么必须按 domain：国际域两套主机名并存（老账号 workbuddy.ai、官方 CLI 新登录
+// codebuddy.ai），只按 realm 选主机必然把一半账号打到非其签发域。
+func TestGlobalBaseByDomain(t *testing.T) {
+	c := New()
+	c.ChatBaseGlobal = ""
+	c.BillingBaseGlobal = ""
+
+	cases := []struct {
+		name        string
+		domain      string
+		realm       string
+		wantChat    string
+		wantBilling string
+		wantWeb     string
+	}{
+		{name: "官方国际站", domain: "www.codebuddy.ai",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "官方国际站裸域", domain: "codebuddy.ai",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "旧桌面端", domain: "www.workbuddy.ai",
+			wantChat: "https://www.workbuddy.ai", wantBilling: "https://www.workbuddy.ai", wantWeb: "https://www.workbuddy.ai"},
+		{name: "旧桌面端裸域", domain: "workbuddy.ai",
+			wantChat: "https://www.workbuddy.ai", wantBilling: "https://www.workbuddy.ai", wantWeb: "https://www.workbuddy.ai"},
+		// 显式 realm=global 但 domain 缺失/非国际域（手写扁平 auth）→ 回落官方国际站默认，
+		// 不按 domain 猜。
+		{name: "global 无 domain 回落默认", realm: "global", domain: "",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "global 非国际域回落默认", realm: "global", domain: "example.com",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		// 非 global 账号恒走 CN 三域（realm 决定域，domain 只在 global 内选主机）。
+		// CN 三个 base 同源（2026-10-28 起）：客户端把 chat / billing / web 全打到
+		// www.workbuddy.cn（5.9.3 真机 23 条 checkin + 12 条 resource + 13 条 growth 全在此域）。
+		{name: "空 domain 非 global 走 CN", domain: "",
+			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.workbuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+		{name: "非国际域非 global 走 CN", domain: "example.com",
+			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.workbuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &auth.Auth{Domain: tc.domain, AccessToken: "at"}
+			if tc.realm != "" {
+				if _, err := auth.BackfillRealmFor(a, tc.realm); err != nil {
+					t.Fatalf("set realm: %v", err)
+				}
+			}
+			if got := c.chatBase(a); got != tc.wantChat {
+				t.Errorf("chatBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantChat)
+			}
+			if got := c.billingBase(a); got != tc.wantBilling {
+				t.Errorf("billingBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantBilling)
+			}
+			if got := c.webBase(a); got != tc.wantWeb {
+				t.Errorf("webBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantWeb)
+			}
+		})
+	}
+
+	// 显式配置优先于 domain 推断（部署侧要指到自建反代时不能被 domain 覆盖）。
+	c.ChatBaseGlobal = "https://chat.global.example"
+	c.BillingBaseGlobal = "https://billing.global.example"
+	a := &auth.Auth{Domain: "www.codebuddy.ai", AccessToken: "at"}
+	if got := c.chatBase(a); got != "https://chat.global.example" {
+		t.Errorf("显式 ChatBaseGlobal 被 domain 覆盖：%q", got)
+	}
+	if got := c.billingBase(a); got != "https://billing.global.example" {
+		t.Errorf("显式 BillingBaseGlobal 被 domain 覆盖：%q", got)
+	}
+}
+
 func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	c := New()
 	if c.ChatHTTP == nil {
@@ -534,13 +772,16 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 }
 
 func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
-	// 上游双键：老模型 reasoning.effort（auto），新模型（glm-5.3 系）只有 reasoning.defaultEffort；
+	// 上游双键：老模型 reasoning.effort（hy3），新模型（glm-5.3 系）只有 reasoning.defaultEffort；
 	// credits/maxAllowedSize/canDisableThinking/supportsReasoning 等尺寸与能力字段应一并透出。
+	//
+	// 注：这条用例原先拿 auto 当「老键模型」，但 auto 是客户端自动模式开关、已从
+	// 名单里剔掉（见 clientpick.go 的 autoModeIDs），故换 hy3——它同样只带老键。
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"models":[
 			{"id":"glm-5.3","maxInputTokens":1000000,"maxOutputTokens":48000,"maxAllowedSize":1000000,"credits":"x0.79","supportsReasoning":true,"reasoning":{"defaultEffort":"high","canDisableThinking":true,"supportedEfforts":["low","high","max"]}},
-			{"id":"auto","maxInputTokens":168000,"maxOutputTokens":32000,"supportsReasoning":true,"reasoning":{"effort":"high"}}
-		],"agents":[{"name":"cli","models":["glm-5.3","auto"]}]}}`), nil
+			{"id":"hy3","maxInputTokens":192000,"maxOutputTokens":64000,"supportsReasoning":true,"reasoning":{"effort":"high"}}
+		],"agents":[{"name":"cli","models":["glm-5.3","hy3"]}]}}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	infos, err := c.FetchModels(a)
@@ -564,8 +805,8 @@ func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
 	if got := c.ModelRate("cn", "glm-5.3"); got != "0.79" {
 		t.Errorf("glm-5.3 ModelRate=%q want 0.79", got)
 	}
-	if au := byID["auto"]; au.DefaultEffort != "high" {
-		t.Errorf("auto DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
+	if au := byID["hy3"]; au.DefaultEffort != "high" {
+		t.Errorf("hy3 DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
 	}
 }
 
@@ -605,8 +846,8 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			if r.Header.Get("User-Agent") != v3ProbeUACNForTest {
+				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), v3ProbeUACNForTest)
 			}
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
@@ -648,5 +889,96 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	}
 	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
+	}
+}
+
+// TestV3PromotionsEmbedImageModel 出图模型只出现在 modelPromotions 里时也要进目录。
+//
+// 实测（2026-10-22，global 个人号）：/v3/config 的 data.models 里**没有任何**图片模型，
+// 可用的 hy-image-3.5 只以纯模型定义形态夹在 modelPromotions 中
+// （{"id":"hy-image-3.5","name":...,"tags":["text-to-image","image-to-image"]}，
+// 没有 kind/discount）。只解析 models 会得出「国际版没有出图模型」的假结论，
+// 而它实际可调（200 + usage{output_image_tokens:15000, credit:0.27}）。
+func TestV3PromotionsEmbedImageModel(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/v3/config") {
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":1000000,"maxOutputTokens":65536}
+			],"modelPromotions":[
+				{"id":"hy3-free","kind":"discount","modelIds":["glm-5.2"],"priority":200,"discount":{"discountedCredits":"0x","factor":0}},
+				{"id":"hy-image-3.5","name":"HY-Image-3.5","tags":["text-to-image","image-to-image"]},
+				{"id":"kling-video-v3","name":"Kling-Video-V3","tags":["text-to-video","image-to-video"]}
+			]}}`), nil
+		}
+		return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "www.workbuddy.ai"}
+	if _, err := c.FetchModels(a); err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	kinds := map[string]string{}
+	for _, m := range c.GenerationModels("cn") {
+		kinds[m.ID] = m.GenerationKind
+	}
+	if kinds["kling-video-v3"] != "video" {
+		t.Errorf("modelPromotions 里的出视频模型应进留存，实际 %+v", kinds)
+	}
+	// 注意：GenerationModels 还会按 imageRouteRealm 做域过滤（hy-image-3.5 是 global
+	// 模型），所以这里直接看留存本体，验证的是「解析有没有把它收进目录」。
+	stashed := map[string]bool{}
+	for _, m := range c.imageModels["cn"] {
+		stashed[m.ID] = true
+	}
+	if !stashed["hy-image-3.5"] {
+		t.Errorf("modelPromotions 里的出图模型未进留存：%v", c.imageModels["cn"])
+	}
+	// 折扣条目（id 是优惠名而非模型名）不得被当成模型塞进目录。
+	if stashed["hy3-free"] {
+		t.Errorf("折扣条目不应被当作模型：%v", c.imageModels["cn"])
+	}
+}
+
+// TestIsModelRateLimitCodes 模型级限流的 code 集合：6004（已有）与 14003（模型忙）。
+// 14003 若漏收，槽位会落到账号级冷却——一个模型抖动就能冷掉整池（同类实现的线上事故形态）。
+func TestIsModelRateLimitCodes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"6004 完整形态", `{"code":6004,"msg":"将在 2026-10-05 20:00:00 重置"}`, true},
+		{"6004 带空格", `{"code": 6004}`, true},
+		{"14003 模型忙", `{"code":14003,"msg":"too many requests"}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"14018 额度耗尽不算模型级", `{"code":14018,"msg":"credits exhausted"}`, false},
+		{"11140 账号风控不算模型级", `{"code":11140,"msg":"request illegal"}`, false},
+		{"无 code", `{"msg":"too many requests"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelRateLimit(c.body); got != c.want {
+			t.Errorf("%s: IsModelRateLimit=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 区分「模型繁忙」14003 与「额度窗口用满」6004：前者没有恢复
+// 时刻，只能短窗口退避；后者带「将在 … 重置」的权威墙钟。两者混用会让一次
+// 瞬时抖动被停成十分钟（线上国际版就是这样整池冷 10 分钟）。
+func TestIsModelBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"14003 完整形态", `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"}}`, true},
+		{"14003 带空格", `{"code": 14003}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"6004 不是繁忙", `{"code":6004,"msg":"将在 2026-10-20 16:37:47 UTC+8 重置"}`, false},
+		{"requestId 里出现 14003 不误判", `{"code":1,"requestId":"14003abc"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBusy(c.body); got != c.want {
+			t.Errorf("%s: IsModelBusy=%v want %v", c.name, got, c.want)
+		}
 	}
 }

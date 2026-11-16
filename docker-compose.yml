@@ -1,6 +1,15 @@
 services:
   wb2api:
-    build: .
+    # 默认使用上游预编译镜像：docker compose pull && docker compose up -d --no-build。
+    # latest 跟随 main；固定版本可用 :2026.11.1.905（镜像标签不带 v）。
+    image: ghcr.io/misakano7545/workbuddy2api-panel:latest
+    # 源码构建：注释 image，取消下面 build 段的注释，
+    # 再 git pull && docker compose up -d --build；两种方式二选一。
+    # build:
+    #   context: .
+    #   args:
+    #     APP_VERSION: ${APP_VERSION:-dev}
+    # 自建版本默认 dev；如需版本比较，在 .env 设置 APP_VERSION（例如 2026.11.3.820）。
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
@@ -13,6 +22,9 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 程序缺省只绑 127.0.0.1（宿主机部署更安全），容器内必须显式放开，
+      # 否则下面的 ports 映射进来的连接一律被拒。
+      - WB2A_LISTEN=0.0.0.0:7863
     ports:
       - "7863:7863"
     volumes:

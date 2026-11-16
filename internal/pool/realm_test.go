@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
 
 // realmPool 构造一个含 cn/global 账号的池，并确保 globalEnabled 开关开启（缺省）。
@@ -97,7 +97,7 @@ func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
 	}
 
 	// 关闭总开关后逐账号只出现一次，旧行为完全恢复。
-	p.SetPreferExpiring(false)
+	p.SetPreferExpiring(false, 0)
 	got = p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
 	want = []string{"cn1", "cn2"}
 	if !reflect.DeepEqual(got, want) {
