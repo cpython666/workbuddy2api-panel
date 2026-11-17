@@ -938,6 +938,11 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// ClientIdentityHeaders 桌面端主进程 RPC 族的 X-Client-* 三头开关
+	// （features.client_identity_headers，默认 true）。只对 CN realm 生效，
+	// global 实测不发；chat 链恒剥离（见 client_identity.go）。
+	ClientIdentityHeaders atomic.Bool
+
 	// SanitizeBrandScope 身份类规则（品牌词）的作用域："all"（默认，所有消息角色，
 	// 与上游既有行为一致）或 "identity"（仅 system/developer；features.sanitize_brand_scope）。
 	SanitizeBrandScope atomic.Value // string
@@ -1049,6 +1054,7 @@ func New() *Client {
 		GlobalEnabled: true,
 	}
 	c.SanitizeFingerprints.Store(true)
+	c.ClientIdentityHeaders.Store(true)
 	c.SanitizeBrandScope.Store("all")
 	return c
 }

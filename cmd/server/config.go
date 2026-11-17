@@ -319,6 +319,10 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ClientIdentityHeaders 桌面端主进程 RPC 族的 X-Client-Version / -Platform /
+		// -Product 三头（默认 true，与国内版 5.11.3 客户端一致）。只对 CN realm 生效；
+		// global 实测不发，chat 链恒剥离。出问题可置 false 回滚。面板保存后热生效。
+		ClientIdentityHeaders bool `json:"client_identity_headers"`
 		// ProxyExitLookup 代理健康探测时经该代理查一次出口画像（国家 / 住宅或机房 / ISP，
 		// proxypool/intel.go），缺省 false，热生效。每个节点每 6 小时一次第三方请求（ip-api 免费档仅明文 HTTP）。
 		ProxyExitLookup bool `json:"proxy_exit_lookup"`
@@ -657,6 +661,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.ClientIdentityHeaders = true
 	c.Features.SanitizeBrandScope = "all"
 	// 6020/6021 排队等待（见 internal/server/handler.go 的 ErrUpstreamBusy 分支）：
 	// 缺省等一轮（60s 上限），避免把上游明说「40 秒后再来」的排队秒变成客户端可见失败。
@@ -863,6 +868,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SANITIZE_BRAND_SCOPE"); v != "" {
 		c.Features.SanitizeBrandScope = v
 	}
+	if v := os.Getenv("WB2A_CLIENT_IDENTITY_HEADERS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ClientIdentityHeaders = b
+		}
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -970,6 +980,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
 		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
+		{"WB2A_CLIENT_IDENTITY_HEADERS", "features.client_identity_headers", "bool"},
 		{"WB2A_SANITIZE_BRAND_SCOPE", "features.sanitize_brand_scope", ""},
 		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
 		{"WB2A_THINKING_ENABLED", "thinking.enabled", "bool"},

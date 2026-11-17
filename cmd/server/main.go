@@ -253,6 +253,7 @@ func main() {
 	proxies.SetExitLookup(cfg.Features.ProxyExitLookup)
 	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.ClientIdentityHeaders.Store(cfg.Features.ClientIdentityHeaders)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
 	up.KeepRecentRounds.Store(int64(cfg.Prompt.KeepRecentRounds))
 	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
@@ -988,6 +989,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		ModelFallback:          newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.ClientIdentityHeaders.Store(newCfg.Features.ClientIdentityHeaders)
 	if up.ProxyPool != nil {
 		up.ProxyPool.SetExitLookup(newCfg.Features.ProxyExitLookup)
 	}

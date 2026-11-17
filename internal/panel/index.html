@@ -1817,6 +1817,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+            <div class="switch"><span class="lb">客户端身份头 X-Client-*</span>
+              <input type="checkbox" name="client_identity_headers"></div>
+            <div class="hint">默认开启，与国内版 5.11.3 桌面客户端一致：仅在主进程 RPC 链（<code>/v3/config</code>、<code>/v2/report</code>、billing 等）发送
+              <code>X-Client-Version</code> / <code>X-Client-Platform</code> / <code>X-Client-Product</code>；国际版不发，chat 链始终不带。出问题可关闭回滚。</div>
             <label class="fld"><span class="lb">品牌词规则作用域</span>
               <select name="sanitize_brand_scope">
                 <option value="all">all — 所有消息角色（默认，与上游一致）</option>

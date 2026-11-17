@@ -1977,6 +1977,7 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   keep_recent_rounds: ['prompt', 'keep_recent_rounds'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  client_identity_headers: ['features', 'client_identity_headers'],
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
   embeddings_enabled: ['features', 'embeddings_enabled'],
   three_d_enabled: ['features', 'three_d_enabled'],

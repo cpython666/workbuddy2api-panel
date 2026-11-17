@@ -321,6 +321,10 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// 头里；真机 /v2/chat/completions 的 40 个出站头逐一比对也没有它们。设备标识是放在
 	// /v2/report 的 **body** 里（machineId / sessionId 字段），不是头。旧实现按 uid 派生
 	// 两个 36 hex 塞进头里，是纯粹的网关自造指纹。
+	//
+	// X-Client-* 三头：5.11.3 起主进程 RPC 族（含 /v3/config、/v2/report）真机实测
+	// 在头列表末尾追加，见 client_identity.go。
+	c.injectClientIdentity(req, a)
 }
 
 // acceptLanguageFor 返回 Accept-Language。
@@ -448,6 +452,10 @@ type ChatMeta struct {
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
+	// chat 链不带主进程的 X-Client-* 三头：内置 CLI 把这组常量列在
+	// isSkippableInternalHeader 的待剥离名单里，零发送点。CommonHeaders 已注入，
+	// 这里显式摘掉（见 client_identity.go）。
+	stripClientIdentity(req)
 	// chat 出站头剥离：CommonHeaders 是 REST 层通用形态，桌面端 chat 并不发这几个
 	// （两版客户端真机实测，见 capture/raw3 + capture/raw8 的逐头对照）：
 	//   Origin / Referer     ← CLI 客户端没有浏览器语义，chat 路径从不发
@@ -930,6 +938,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+	// X-Client-* 三头：billing 与 report 同属主进程 RPC 族，真机同带。
+	c.injectClientIdentity(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
