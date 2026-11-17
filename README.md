@@ -492,6 +492,19 @@ macOS 上不用自己拼常驻方案：社区维护了一个菜单栏启动器�
 
 DMG 未公证，首次打开需要右键 →「打开」。
 
+## 🔁 换二进制重启（`scripts/safe-restart.sh`）
+
+这台机器上的 `wb2api` 没有守护进程，`kill` 之后不会自己起来；而它往往同时是本机 AI 对话的模型出口，杀错了会直接掐断正在进行的会话。换二进制走脚本，别手工杀：
+
+```bash
+go build -o wb2api.next ./cmd/server
+scripts/safe-restart.sh wb2api.next        # 等端口空闲再换，失败自动回滚
+scripts/safe-restart.sh wb2api.next --now  # 立即换（会切断正在进行的请求）
+scripts/safe-restart.sh wb2api.next --check # 只预检，不碰线上进程
+```
+
+四步：先用备用端口在临时目录里把候选二进制跑一遍（不通过就一个字节都不动）→ 等监听端口连续 10 秒没有已建立连接 → 用 `rename` 换掉二进制（直接覆盖运行中的文件可能把进程写崩）→ 起新进程并在 30 秒内做健康检查，不过就换回 `wb2api.rollback` 重新拉起。健康判定看 `/healthz` 的 `service` 字段而不是 200：池里一个健康号都没有时它也返回 503，那仍然算「起来了」。
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
