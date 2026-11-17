@@ -986,6 +986,12 @@ type Client struct {
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
 
+	// CodeBuddyBaseCN / OpenBaseCN 是技能分享任务用的两个域（技能市场与开放平台
+	// 资产分享）。它们不随 realm 变化、也没有配置项：留空走内置默认，测试用它们
+	// 把绝对地址指到假服务器上（面板测试改不到包级变量）。
+	CodeBuddyBaseCN string
+	OpenBaseCN      string
+
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
 	ChatBaseGlobal    string
