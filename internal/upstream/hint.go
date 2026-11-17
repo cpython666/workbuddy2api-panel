@@ -175,6 +175,24 @@ func isModelParamInvalid(body string) bool {
 		strings.Contains(lower, "request parameters do not meet the current model requirements")
 }
 
+// isToolSchemaRejected 上游 11129「工具定义不合规」body 判定。
+//
+// 触发源是 tools[].function.parameters 里上游强类型反序列化不认的写法（关键字值
+// 类型不符、Python 风格 type 别名等，见 schema_harden.go）。它和 11133 同族：
+// 确定性请求级错误，同一 body 换任何账号都会被同一处拒绝。
+//
+// 只有这一层判定还不够——payload.go 的纠正只能覆盖已知写法，未知写法仍会打到上游。
+// 归 ErrModelParamInvalid 而不是 ErrClient 的原因是后者会喂连败计数（issue #114），
+// 一个客户端发坏 schema 就能把轮转到的账号逐个降权到出池，最终演成
+// no_healthy_account 503（上游 issue #250 的实案）。
+func isToolSchemaRejected(body string) bool {
+	lower := strings.ToLower(body)
+	return codeMarker(lower, "11129") ||
+		strings.Contains(lower, "invalid function call parameters") ||
+		strings.Contains(lower, "invalid_function_call_parameters") ||
+		strings.Contains(body, "工具定义不合规")
+}
+
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /
 // "replace the image" msg 家族）。
 func isInvalidImageData(body string) bool {

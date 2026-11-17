@@ -712,18 +712,24 @@ func normalizeToolPatterns(obj map[string]any) {
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
 			normalizeSchemaTree(fn["parameters"])
+			coerceFunctionDescription(fn)
 		}
+		coerceFunctionDescription(tool)
 		normalizeSchemaTree(tool["parameters"])
 	}
 }
 
 // normalizeSchemaTree 递归归一化工具参数 schema 树：
+//   - 关键字值类型纠偏（数字/布尔/字符串/数组关键字，Python 风格 type 别名），
+//     见 hardenSchemaKeywords——上游对 tools[].function.parameters 做 Go 强类型
+//     反序列化，值类型不符整条 400 code 11129；
 //   - pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是正则；
 //     map 键不可原地改，命中时重建该层）；
 //   - 只有 enum、没有 type 的属性补上可无损推断的类型（见 inferEnumType）。
 func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
+		hardenSchemaKeywords(n)
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
 			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
 		}
