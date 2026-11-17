@@ -2226,6 +2226,8 @@ function openAdd() {
   $('addQr').hidden = true; $('addQr').innerHTML = ''; // 上一次的 state 已作废，二维码不留
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   $('btnAddApiKey').hidden = true;
+  $('backupDone').hidden = true; $('backupErr').hidden = true;
+  renderBackupPick();
   stopPoll();
 }
 function switchAddTab(tab) {
@@ -2233,6 +2235,7 @@ function switchAddTab(tab) {
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
   $('addTabApiKey').hidden = tab !== 'apikey';
+  $('addTabBackup').hidden = tab !== 'backup';
   // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、
   // 导入页「确认导入」（仅预览通过后出现，见 renderImportPreview）。
   $('btnAddApiKey').hidden = tab !== 'apikey';
@@ -2468,6 +2471,160 @@ function postImport(dryRun) {
 }
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
+/* ── 账号备份 / 迁移 ───────────────────────────────────────────────── */
+// 导出走 GET /panel/api/accounts/export（明文凭据，响应 no-store）；加口令时在
+// 浏览器里套一层信封（PBKDF2-SHA256 200k → AES-GCM 256），网关看不到口令与明文。
+// 备注本来只存在 localStorage，导出前合并进快照，导入后写回。
+const BACKUP_ITER = 200000;
+function backupStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+}
+function b64enc(u8) {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function b64dec(str) {
+  const bin = atob(str), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+// crypto.subtle 只在安全上下文可用：用 LAN IP + http 打开面板时是 undefined，
+// 这时只能导出明文，得在界面上说清而不是静默失败。
+function backupSecure() {
+  return !!(window.crypto && window.crypto.subtle && window.crypto.getRandomValues);
+}
+async function backupKey(pass, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt, iterations: BACKUP_ITER, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encryptSnapshot(snap, pass) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await backupKey(pass, salt);
+  const plain = new TextEncoder().encode(JSON.stringify(snap));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, plain);
+  return {
+    kind: snap.kind, version: snap.version, encrypted: true,
+    kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: BACKUP_ITER, salt: b64enc(salt) },
+    cipher: { name: 'AES-GCM', iv: b64enc(iv) },
+    ciphertext: b64enc(new Uint8Array(ct)),
+  };
+}
+async function decryptSnapshot(env, pass) {
+  const kdf = env.kdf || {}, salt = b64dec(kdf.salt), iv = b64dec((env.cipher || {}).iv);
+  const key = await backupKey(pass, salt);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, b64dec(env.ciphertext));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+function renderBackupPick() {
+  const box = $('backupPickList');
+  if (!box) return;
+  const rows = ((overviewData && overviewData.accounts) || []).slice()
+    .sort((a, b) => String(a.uid).localeCompare(String(b.uid)));
+  if (!rows.length) { box.innerHTML = '<div class="hint">还没有账号</div>'; return; }
+  box.innerHTML = rows.map(a =>
+    '<label class="pick"><input type="checkbox" value="' + esc(a.uid) + '">'
+    + remarkName(a.uid, esc(a.nickname || a.uid))
+    + '<span class="hint">' + esc(a.realm || '') + (a.enterprise ? ' · 企业' : '') + '</span></label>'
+  ).join('');
+}
+function backupSelected() {
+  return Array.from(document.querySelectorAll('#backupPickList input:checked')).map(i => i.value);
+}
+function backupMark(mode) {
+  const boxes = Array.from(document.querySelectorAll('#backupPickList input'));
+  boxes.forEach(b => { b.checked = mode === 'all' ? true : mode === 'none' ? false : !b.checked; });
+}
+async function exportBackup() {
+  const sel = backupSelected();
+  if (!sel.length) { toast('先勾选要导出的账号', 'warn'); return; }
+  const btn = $('btnBackupExport');
+  const pass = $('backupPass').value;
+  $('backupDone').hidden = true; $('backupErr').hidden = true;
+  if (pass && !backupSecure()) {
+    $('backupErr').hidden = false;
+    $('backupErr').textContent = '当前页面不是安全上下文（用 http + 局域网 IP 打开时浏览器不提供 WebCrypto），无法加密导出；改用 127.0.0.1 打开，或清空口令导出明文。';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const d = await api('accounts/export?uids=' + encodeURIComponent(sel.join(',')));
+    const snap = d.snapshot;
+    const remarks = remarksAll();
+    (snap.accounts || []).forEach(a => { const r = remarks[remarkKey(a.uid)]; if (r) a.remark = r; });
+    let text, name;
+    if (pass) {
+      text = JSON.stringify(await encryptSnapshot(snap, pass), null, 2);
+      name = 'workbuddy-accounts-' + backupStamp() + '.enc.json';
+    } else {
+      text = JSON.stringify(snap, null, 2);
+      name = 'workbuddy-accounts-' + backupStamp() + '.json';
+    }
+    downloadText(name, text);
+    $('backupDone').hidden = false;
+    $('backupDone').textContent = '已导出 ' + (snap.accounts || []).length + ' 个账号到 ' + name
+      + (d.missing && d.missing.length ? '；未找到：' + d.missing.join(', ') : '')
+      + (pass ? '（已加密）' : '（明文，注意保管）');
+  } catch (e) {
+    $('backupErr').hidden = false;
+    $('backupErr').textContent = '导出失败：' + e.message;
+  }
+  btn.disabled = false;
+}
+async function importBackup() {
+  const f = ($('backupFile').files || [])[0];
+  const btn = $('btnBackupImport');
+  $('backupDone').hidden = true; $('backupErr').hidden = true;
+  if (!f) { toast('先选一个备份文件', 'warn'); return; }
+  const mode = (document.querySelector('input[name="backupMode"]:checked') || {}).value || 'merge';
+  btn.disabled = true;
+  try {
+    let snap = JSON.parse(await f.text());
+    if (snap && snap.encrypted) {
+      const pass = $('backupPassIn').value;
+      if (!pass) throw new Error('这个备份加了口令，先在下面填口令');
+      if (!backupSecure()) throw new Error('当前页面不是安全上下文，浏览器解不开加密备份；改用 127.0.0.1 打开');
+      snap = await decryptSnapshot(snap, pass);
+    }
+    // 解密只在浏览器里发生；网关收到的一律是已解密的快照。
+    const d = await api('accounts/import?mode=' + encodeURIComponent(mode), { method: 'POST', body: JSON.stringify(snap) });
+    const remarks = remarksAll();
+    let touched = 0;
+    (snap.accounts || []).forEach(a => { if (a.remark) { remarks[remarkKey(a.uid)] = a.remark; touched++; } });
+    if (touched && storeRemarks(remarks)) { /* 备注落到本地，下次渲染即生效 */ }
+    $('backupDone').hidden = false;
+    $('backupDone').textContent = (mode === 'merge' ? '合并完成：' : '覆盖完成：')
+      + '新增 ' + (d.created || 0) + ' 个，覆盖 ' + (d.updated || 0) + ' 个'
+      + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '')
+      + (d.errors && d.errors.length ? '（' + d.errors.slice(0, 3).join('；') + '）' : '');
+    if (d.errors && d.errors.length > 3) console.warn('backup import errors:', d.errors);
+    $('backupFile').value = '';
+    $('backupPassIn').value = '';
+    invalidatePackages();
+    await loadOverview(true);
+    renderBackupPick();
+  } catch (e) {
+    $('backupErr').hidden = false;
+    $('backupErr').textContent = '导入失败：' + e.message;
+  }
+  btn.disabled = false;
+}
+$('btnBackupPickAll').onclick = () => backupMark('all');
+$('btnBackupPickNone').onclick = () => backupMark('none');
+$('btnBackupPickInvert').onclick = () => backupMark('invert');
+$('btnBackupExport').onclick = exportBackup;
+$('btnBackupImport').onclick = importBackup;
+
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   if (view === 'proxies') { await loadProxies(); return; }

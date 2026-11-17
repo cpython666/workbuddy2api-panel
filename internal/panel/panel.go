@@ -287,6 +287,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.loginPoll)
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
+	// 账号备份 / 迁移：自包含快照，merge 只增不改、replace 覆盖所选但保留快照外账号。
+	p.mux.HandleFunc("GET /panel/api/accounts/export", p.exportAccounts)
+	p.mux.HandleFunc("POST /panel/api/accounts/import", p.importAccounts)
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.accountDisable)
