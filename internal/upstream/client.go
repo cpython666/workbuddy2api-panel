@@ -805,6 +805,15 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusBadRequest && isModelParamInvalid(body) {
 		return ErrModelParamInvalid
 	}
+	// 11129「invalid function call parameters」：工具定义被上游强类型反序列化拒绝，
+	// 与 11133 同族（请求级、确定性）。payload.go 的 schema_harden.go 已纠正已知
+	// 形态，走到这里说明是没覆盖的写法——同一 body 换任何账号都会被同一处拒绝。
+	// 不在此分流会落 ErrClient，而 ErrClient 会喂连败计数（issue #114）：一个坏
+	// schema 就能顺着轮转把整池健康号逐个降权到出池，最后 503 no_healthy_account
+	//（上游 misakano7545/workbuddy2api-panel#250 的实案）。
+	if status == http.StatusBadRequest && isToolSchemaRejected(body) {
+		return ErrModelParamInvalid
+	}
 	// 11151「a message has empty content」：空 text 段被上游判为硬 400。出站前
 	// empty_text_part.go 已经补位（含「字符串被当 parts 嗅探」那种），到这里说明
 	// 补位没覆盖的形态（例如不经 payload 管线的端点），但它是**同一请求的错**：
