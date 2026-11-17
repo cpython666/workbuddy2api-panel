@@ -95,6 +95,7 @@
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
+    "client_identity_headers": true,
     "sanitize_brand_scope": "all",
     "proxy_exit_lookup": false,
     "embeddings_enabled": false,

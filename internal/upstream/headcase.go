@@ -51,6 +51,9 @@ var officialHeaderSpelling = map[string]string{
 	"x-requested-with":  "X-Requested-With",
 	"x-user-id":         "X-User-Id",
 	"x-client-platform": "X-Client-Platform",
+	// 5.11.3 主进程 client-identity（真机抓包，头列表末尾追加）：
+	"x-client-version": "X-Client-Version",
+	"x-client-product": "X-Client-Product",
 
 	// —— 官方全小写（Node 侧字面量就是小写；三个 B3/链路头尤其） ——
 	"x-stainless-arch":            "x-stainless-arch",

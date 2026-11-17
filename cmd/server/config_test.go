@@ -1188,6 +1188,19 @@ func TestThinkingEnvOverride(t *testing.T) {
 	}
 }
 
+func TestClientIdentityHeadersDefaultAndEnv(t *testing.T) {
+	c := Default()
+	if !c.Features.ClientIdentityHeaders {
+		t.Fatal("client_identity_headers 默认应为 true")
+	}
+	t.Setenv("WB2A_CLIENT_IDENTITY_HEADERS", "false")
+	c = Default()
+	applyEnv(c)
+	if c.Features.ClientIdentityHeaders {
+		t.Fatal("WB2A_CLIENT_IDENTITY_HEADERS=false 未生效")
+	}
+}
+
 func TestConfigExampleParses(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
 	if err != nil {
