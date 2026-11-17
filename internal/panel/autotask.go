@@ -135,6 +135,12 @@ var autoActions = []autoAction{
 		run:      runSkillFresh,
 	},
 	{
+		TaskCode: "skill_share",
+		Desc:     "真实创建技能分享渠道 + 渠道动作事件（未真机复核，尝试型）",
+		Attempt:  true,
+		run:      runSkillShare,
+	},
+	{
 		TaskCode: "Expert_lighthouse",
 		Desc:     "真实轻量云专家召唤+使用链（chat 链带 has_expert，已验证：两账号点亮）",
 		run:      runExpertLighthouse,
@@ -1130,6 +1136,76 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 		return "", fmt.Errorf("skill_info 事件: %w", err)
 	}
 	return "已上报真实对话 + skill_info 技能加载事件", nil
+}
+
+// runSkillShare 完成 skill_share（分享技能给好友，每天 50 积分）。
+//
+// 这条不是普通 /v2/report 单事件：官方口径要求「真的建过一条分享渠道」。所以流程是
+// 技能市场取一条真实技能 → 开放平台创建 c2c 分享渠道（拿 share_code）→ 用这个
+// share_code 作为事件 id 上报两次 skill_share_channel_action（点击 + 成功）。
+// 市场为空或渠道建失败就直接报错，绝不伪造 share_code 凑事件。
+//
+// 进度轮询与领奖由 executeAutoTask 统一做，这里不 claim。
+func runSkillShare(p *Panel, a *auth.Auth) (string, error) {
+	skills, err := p.cfg.Upstream.MarketSkillList(a)
+	if err != nil {
+		return "", fmt.Errorf("技能市场列表: %w", err)
+	}
+	skill, ok := pickShareSkill(skills)
+	if !ok {
+		return "", fmt.Errorf("技能市场没有可分享的技能")
+	}
+	ch, err := p.cfg.Upstream.CreateSkillShareChannel(a, skill)
+	if err != nil {
+		return "", fmt.Errorf("创建分享渠道: %w", err)
+	}
+	now := time.Now().UnixMilli()
+	base := map[string]any{
+		"eventCode": "skill_share_channel_action",
+		"skillId":   skill.Key(),
+		"skillName": skill.Title(),
+		"skillType": "market",
+		"action":    "link",
+		"cost":      0,
+		"id":        ch.ShareCode,
+		"actionAt":  now,
+	}
+	click := upstream.DesktopEvent{}
+	success := upstream.DesktopEvent{}
+	for k, v := range base {
+		click[k] = v
+		success[k] = v
+	}
+	click["panelAction"] = "click"
+	click["panelType"] = "clipboard"
+	click["isSuccessful"] = true
+	success["panelAction"] = "success"
+	success["panelType"] = "clipboard"
+	success["isSuccessful"] = true
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, click, success); err != nil {
+		return "", fmt.Errorf("上报分享动作事件: %w", err)
+	}
+	return "已创建技能分享渠道并上报分享动作（" + skill.Title() + "，share_code=" + ch.ShareCode + "）", nil
+}
+
+// pickShareSkill 优先选实测能计分的那条技能，否则退回首条带 id 的。
+func pickShareSkill(skills []upstream.MarketSkill) (upstream.MarketSkill, bool) {
+	var first *upstream.MarketSkill
+	for i := range skills {
+		if skills[i].Key() == "" {
+			continue
+		}
+		if skills[i].Key() == upstream.PreferredShareSkillID {
+			return skills[i], true
+		}
+		if first == nil {
+			first = &skills[i]
+		}
+	}
+	if first == nil {
+		return upstream.MarketSkill{}, false
+	}
+	return *first, true
 }
 
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。

@@ -389,6 +389,7 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 | `Hp_Appearance` | +100c +5e | 主题设置 + 皮肤生效事件 |
 | `Expert_lighthouse` | +100c +5e | 轻量云专家召唤+使用链（真实对话 requestId，**可免费领一个月轻量服务器**） |
 | `skill_1` | +100c +5e | 真实对话 + 技能加载事件（skill_info） |
+| `skill_share` | 每日 50c | 技能市场取真实技能 → 开放平台建 c2c 分享渠道（拿 `share_code`）→ 用该 code 上报 `skill_share_channel_action` ×2。**未真机复核**，面板标为尝试型；市场为空或没拿到 `share_code` 就报错，不伪造事件 |
 
 **全新账号一键全做完 ≈ +1950 credits +78 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1` 各数条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
 
